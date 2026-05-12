@@ -1,0 +1,73 @@
+# latzero-server
+
+`latzero-server` is the local TCP daemon for LatZero server mode.
+
+It listens on `127.0.0.1:14130` by default, manages named pools, routes
+app-to-app calls, tracks subscriptions, and persists selected buffers to disk.
+
+## Quick Start
+
+```bash
+latzero-server
+```
+
+Launch the interactive dashboard:
+
+```bash
+latzero-server --tui
+```
+
+## Features
+
+- Named open or auth-guarded pools
+- One connected pool per client session
+- JSON-over-TCP protocol
+- Targeted app calls and third-party response routing
+- Explicit buffer subscriptions
+- Optional per-buffer persistence via JSON snapshots
+
+## Protocol Overview
+
+Each line on the socket is one JSON object with:
+
+- `type`
+- `request_id`
+- `client_id`
+- `pool`
+- `payload`
+
+Important message types:
+
+- `join_pool`
+- `switch_pool`
+- `set_buffer`
+- `get_buffer`
+- `subscribe_buffer`
+- `call_app`
+- `app_result`
+- `emit_event`
+- `presence_update`
+- `buffer_update`
+- `ack`
+- `error`
+
+## Dashboard Controls
+
+When you launch with `--tui`:
+
+- `tab` / `shift+tab`: switch panes
+- `j` / `k` or arrow keys: move selection
+- `p`, `c`, `b`, `e`: jump to pools, clients, buffers, events
+- `r`: refresh
+- `q`: quit
+
+## Client Mode
+
+Use the `LatZero` client from `python-client`:
+
+```python
+from latzero import LatZero
+
+client = LatZero("latzero://client-1", pool="demo")
+client.set("buffer", {"hello": "world"}, persistent=True)
+```

@@ -1,0 +1,2 @@
+[console_scripts]
+latzero-server = latzero_server.cli:main
