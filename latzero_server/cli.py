@@ -26,6 +26,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Launch the interactive terminal dashboard",
     )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run without TUI (headless mode)",
+    )
     return parser
 
 
@@ -38,19 +43,26 @@ async def _run(args: argparse.Namespace) -> None:
     server = LatZeroServer(config=config)
     try:
         await server.start()
-        if True:
-            dashboard = ServerDashboard(server)
-            await dashboard.run()
-        else:
+        
+        if args.headless:
+            # Hide the console completely if on Windows and running headless
+            if sys.platform == "win32":
+                import ctypes
+                import os
+                ctypes.windll.kernel32.FreeConsole()
+                sys.stdout = open(os.devnull, 'w')
+                sys.stderr = open(os.devnull, 'w')
+                
             print(
                 f"latzero-server listening on {config.host}:{config.port} "
                 f"(data-dir: {config.data_dir})",
                 file=sys.stdout,
                 flush=True,
             )
-            assert server._server is not None
-            async with server._server:
-                await server._server.serve_forever()
+            await server.serve_forever()
+        else:
+            dashboard = ServerDashboard(server)
+            await dashboard.run()
     finally:
         await server.stop()
 
