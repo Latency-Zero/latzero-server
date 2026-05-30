@@ -174,7 +174,7 @@ def activity_dot(active: bool) -> FT:
 class ServerDashboard:
     """High-fidelity infrastructure control plane for LatZero."""
 
-    PANES = ("pools", "clients", "processes", "buffers", "events")
+    PANES = ("pools", "clients", "processes", "buffers", "events", "workers", "queue")
 
     def __init__(self, server: LatZeroServer, refresh_interval: float = 0.5):
         self.server = server
@@ -188,7 +188,9 @@ class ServerDashboard:
         # History for sparklines
         self._history: Dict[str, List[float]] = {
             "tps": [],
-            "latency": []
+            "latency": [],
+            "queue_depth": [],
+            "worker_count": [],
         }
 
         def mk(key): return FormattedTextControl(lambda k=key: self._cache.get(k, [("", "")]), focusable=False)
@@ -281,8 +283,14 @@ class ServerDashboard:
             _box("buffers",   " Buffers ",   width=D(preferred=36)),
         ])
 
+        scaling_row = VSplit([
+            _box("workers", " Workers ",     width=D(preferred=50)),
+            _box("queue",   " Queue ",       width=D(preferred=46)),
+        ])
+
         body = HSplit([
             top_row,
+            scaling_row,
             VSplit([
                 _box("events", " Events Log "),
                 _box("detail", " Inspector ", width=D(preferred=60)),
@@ -304,13 +312,17 @@ class ServerDashboard:
     def _build_keys(self) -> KeyBindings:
         kb = KeyBindings()
 
-        @kb.add("q")
+        # Quit on Q (shift+q) and ctrl+c — freeing lowercase q for the Queue pane
+        @kb.add("Q")
         @kb.add("c-c")
         def _quit(ev):
             self._running = False
             ev.app.exit()
 
-        for key, pane in [("p","pools"),("c","clients"),("x","processes"),("b","buffers"),("e","events")]:
+        for key, pane in [
+            ("p", "pools"), ("c", "clients"), ("x", "processes"),
+            ("b", "buffers"), ("e", "events"), ("w", "workers"), ("q", "queue"),
+        ]:
             @kb.add(key)
             def _jump(ev, p=pane):
                 self.active_pane = p
@@ -363,6 +375,10 @@ class ServerDashboard:
             n = max(len(self._sel_pool().get("processes", {})), 1)
         elif p == "buffers":
             n = max(len(self._sel_pool().get("buffers", [])), 1)
+        elif p == "workers":
+            n = max(len(snap.get("scale_events", [])), 1)
+        elif p == "queue":
+            n = max(len(self._history.get("queue_depth", [])), 1)
         else:
             n = max(len(snap.get("events", [])), 1)
         self._sel[p] = (self._sel[p] + delta) % n
@@ -383,6 +399,8 @@ class ServerDashboard:
         # Update history
         self._history["tps"].append(self._snap.get("tps", 0))
         self._history["latency"].append(self._snap.get("avg_latency", 0))
+        self._history["queue_depth"].append(self._snap.get("queue_depth", 0))
+        self._history["worker_count"].append(self._snap.get("worker_count", 0))
         for k in self._history:
             if len(self._history[k]) > 100:
                 self._history[k].pop(0)
@@ -394,6 +412,8 @@ class ServerDashboard:
         self._cache["buffers"]   = self._r_buffers(pool)
         self._cache["events"]    = self._r_events(self._snap.get("events", []))
         self._cache["detail"]    = self._r_detail(pool)
+        self._cache["workers"]   = self._r_workers(self._snap)
+        self._cache["queue"]     = self._r_queue(self._snap)
         self.application.invalidate()
 
     # ------------------------------------------------------------------
@@ -410,6 +430,11 @@ class ServerDashboard:
         mem = f"{snap.get('memory_rss', 0) / 1024 / 1024:.1f}MB"
         tps = f"{snap.get('tps', 0):.1f}"
         lat = f"{snap.get('avg_latency', 0) * 1000:.2f}ms"
+        wkr = snap.get('worker_count', 0)
+        wkr_max = snap.get('worker_max', 0)
+        qdepth = snap.get('queue_depth', 0)
+        pred = snap.get('predicted_queue_depth', 0.0)
+        conf = snap.get('prediction_confidence', 0.0)
 
         # Trend indicators
         def trend(hist, lower_is_better=False):
@@ -420,18 +445,31 @@ class ServerDashboard:
 
         tps_arrow = trend(self._history["tps"])
         lat_arrow = trend(self._history["latency"], lower_is_better=True)
+        q_arrow   = trend(self._history["queue_depth"], lower_is_better=True)
+        w_arrow   = trend(self._history["worker_count"])
+
+        # Prediction confidence arrow
+        if conf > 0.7:
+            pred_indicator = green(f"~{pred:.0f}")
+        elif conf > 0.4:
+            pred_indicator = yellow(f"~{pred:.0f}")
+        else:
+            pred_indicator = dim(f"~{pred:.0f}")
 
         return cat(
             [("class:orange bold", " LatØ ")], [("class:dim", "Dashboard  ")],
             [("class:dim", f"  {snap.get('host','?')}:{snap.get('port','?')}  ")],
-            [("", " " * 4)],
+            [("", " " * 2)],
             dim("[ "), muted("TPS "), cyan(f"{tps:>5} "), tps_arrow, dim(" ]  [ "),
             muted("LAT "), cyan(f"{lat:>8} "), lat_arrow, dim(" ]  [ "),
             muted("MEM "), cyan(f"{mem:>7} "), dim(" ]  [ "),
-            muted("UP "), cyan(ut), dim(" ]"),
+            muted("WKR "), cyan(f"{wkr}/{wkr_max} "), w_arrow, dim(" ]  [ "),
+            muted("Q "), cyan(f"{qdepth} "), q_arrow, dim(" ] "),
             [("", "\n")],
             [("", "  ")], sparkline(self._history["tps"], 20),
-            [("", " " * 6)], sparkline(self._history["latency"], 20),
+            [("", " " * 4)], sparkline(self._history["latency"], 20),
+            [("", " " * 4)], sparkline(self._history["queue_depth"], 20),
+            [("", " ")], dim(" pred:"), pred_indicator,
         )
 
     # ------------------------------------------------------------------
@@ -441,7 +479,8 @@ class ServerDashboard:
     def _render_footer(self) -> FT:
         keys = [
             ("P", "pools"),("C", "clients"),("X", "procs"),
-            ("B", "buffers"),("E", "events"),("R", "refresh"),("Q", "quit"),
+            ("B", "buffers"),("E", "events"),("W", "workers"),("Q", "queue"),
+            ("R", "refresh"),("⇧Q", "quit"),
         ]
         res: FT = [("class:dim", "  PANE: "), ("class:cyan bold", self.active_pane.upper()), ("class:dim", "   ")]
         for k, d in keys:
@@ -549,7 +588,132 @@ class ServerDashboard:
             result.extend(_nl())
         return result
 
+    def _r_workers(self, snap: dict) -> FT:
+        """Render the Workers auto-scaling pane."""
+        worker_count = snap.get("worker_count", 0)
+        worker_max   = snap.get("worker_max", 128)
+        worker_min   = snap.get("worker_min", 4)
+        scale_events = snap.get("scale_events", [])
+        predicted    = snap.get("predicted_queue_depth", 0.0)
+        confidence   = snap.get("prediction_confidence", 0.0)
+
+        result: FT = [("", "\n")]
+
+        # Worker count bar
+        bar_width = 20
+        filled = int((worker_count / max(worker_max, 1)) * bar_width)
+        bar = "█" * filled + "░" * (bar_width - filled)
+        result.extend(dim("  "))
+        result.extend(muted("Workers  "))
+        result.extend(cyan(f"{worker_count:>3}"))
+        result.extend(dim(f" │ "))
+        result.extend([(("class:green" if worker_count < worker_max * 0.8 else "class:yellow"), bar)])
+        result.extend(dim(f" max:{worker_max}"))
+        result.extend(_nl())
+
+        # Sparkline
+        result.extend(dim("  hist "))
+        result.extend(sparkline(self._history.get("worker_count", []), 24))
+        result.extend(_nl())
+        result.extend(_nl())
+
+        # Predictive pre-scaling row
+        if confidence > 0.4:
+            pred_style = "class:green" if confidence > 0.7 else "class:yellow"
+            result.extend(dim("  Forecast  "))
+            result.extend([(pred_style, f"~{predicted:.0f} msgs  conf:{confidence*100:.0f}%")])
+            result.extend(_nl())
+        else:
+            result.extend(dim("  Forecast  "))
+            result.extend(dim(f"learning... ({len(self._history.get('queue_depth', []))} samples)"))
+            result.extend(_nl())
+
+        result.extend(_nl())
+        result.extend(dim("  ─── Scale Events ───────────────────\n"))
+
+        # Scale events list
+        if not scale_events:
+            result.extend(dim("  No scaling events yet.\n"))
+        else:
+            active = self.active_pane == "workers"
+            for i, ev in enumerate(scale_events[:8]):
+                is_sel = active and i == self._sel.get("workers", 0)
+                ts = time.strftime("%H:%M:%S", time.localtime(ev["timestamp"]))
+                arrow = "▲" if ev["direction"] == "up" else "▼"
+                arrow_style = "class:green" if ev["direction"] == "up" else "class:red"
+                line_style  = "class:selected" if is_sel else ""
+                result.extend(dim(f" {ts} "))
+                result.extend([(arrow_style, f"{arrow} ")])
+                result.extend([(line_style, f"{ev['old_count']}→{ev['new_count']} ")])
+                reason_short = ev.get("reason", "")[:30]
+                result.extend(dim(reason_short))
+                result.extend(_nl())
+
+        return result
+
+    def _r_queue(self, snap: dict) -> FT:
+        """Render the Queue depth pane."""
+        depth      = snap.get("queue_depth", 0)
+        up_thresh  = 50   # matches config default
+        predicted  = snap.get("predicted_queue_depth", 0.0)
+        confidence = snap.get("prediction_confidence", 0.0)
+        worker_tps = snap.get("worker_tps", 0.0)
+
+        result: FT = [("", "\n")]
+
+        # Queue depth bar
+        bar_width = 20
+        pct = min(depth / max(up_thresh, 1), 1.0)
+        filled = int(pct * bar_width)
+        depth_style = "class:green" if depth < up_thresh * 0.5 else ("class:yellow" if depth < up_thresh else "class:red")
+        bar = "█" * filled + "░" * (bar_width - filled)
+        result.extend(dim("  "))
+        result.extend(muted("Q Depth  "))
+        result.extend([(depth_style, f"{depth:>4}")])
+        result.extend(dim(" │ "))
+        result.extend([(depth_style, bar)])
+        result.extend(dim(f" trig:{up_thresh}"))
+        result.extend(_nl())
+
+        # Sparkline of queue depth history
+        result.extend(dim("  hist "))
+        result.extend(sparkline(self._history.get("queue_depth", []), 24))
+        result.extend(_nl())
+        result.extend(_nl())
+
+        # Worker throughput
+        result.extend(dim("  Worker TPS   "))
+        result.extend(cyan(f"{worker_tps:.1f} msg/s"))
+        result.extend(_nl())
+
+        # Prediction
+        if confidence > 0.4:
+            pred_style = "class:green" if predicted < up_thresh else "class:yellow"
+            result.extend(dim("  Predicted    "))
+            result.extend([(pred_style, f"~{predicted:.0f}")])
+            result.extend(dim(f"  conf:{confidence*100:.0f}%"))
+        else:
+            result.extend(dim("  Predicted    "))
+            result.extend(dim("learning..."))
+        result.extend(_nl())
+        result.extend(_nl())
+
+        result.extend(dim("  ─── Depth Trend ─────────────────────\n"))
+        history = self._history.get("queue_depth", [])
+        if len(history) >= 2:
+            recent = history[-10:]
+            avg = sum(recent) / len(recent)
+            peak = max(recent)
+            result.extend(dim(f"  avg(10s): "))
+            result.extend(cyan(f"{avg:.1f}"))
+            result.extend(dim("   peak: "))
+            result.extend(cyan(f"{peak:.0f}"))
+            result.extend(_nl())
+
+        return result
+
     def _r_detail(self, pool: dict) -> FT:
+
         p = self.active_pane
         
         def _kv(key: str, val: str, is_list=False) -> FT:
@@ -600,6 +764,34 @@ class ServerDashboard:
             val_str = json.dumps(buf.get('value'))
             if len(val_str) > 50: val_str = val_str[:47] + "..."
             res.extend(_kv("VALUE", val_str))
+            return res
+
+        if p == "workers":
+            snap = self._snap
+            res = cat(_nl(), orange("  Worker Pool"), _nl(), dim("  " + "─"*30), _nl())
+            res.extend(_kv("ACTIVE", str(snap.get("worker_count", 0))))
+            res.extend(_kv("MIN", str(snap.get("worker_min", 0))))
+            res.extend(_kv("MAX", str(snap.get("worker_max", 0))))
+            scale_events = snap.get("scale_events", [])
+            res.extend(_kv("EVENTS", str(len(scale_events))))
+            if scale_events:
+                last = scale_events[0]
+                arrow = green("▲") if last["direction"] == "up" else red("▼")
+                res.extend(cat(dim("  LAST SCALE   "), arrow, dim(f" {last['old_count']}→{last['new_count']}"), _nl()))
+                res.extend(dim(f"  {last['reason'][:38]}"))
+                res.extend(_nl())
+            return res
+
+        if p == "queue":
+            snap = self._snap
+            depth = snap.get("queue_depth", 0)
+            pred = snap.get("predicted_queue_depth", 0.0)
+            conf = snap.get("prediction_confidence", 0.0)
+            res = cat(_nl(), orange("  Dispatch Queue"), _nl(), dim("  " + "─"*30), _nl())
+            res.extend(_kv("DEPTH", str(depth)))
+            res.extend(_kv("PREDICTED", f"{pred:.1f}"))
+            res.extend(_kv("CONFIDENCE", f"{conf*100:.0f}%"))
+            res.extend(_kv("WORKER TPS", f"{snap.get('worker_tps', 0.0):.1f}"))
             return res
         
         events = self._snap.get("events", [])

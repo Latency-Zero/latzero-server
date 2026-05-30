@@ -18,6 +18,7 @@ from .config import ServerConfig
 from .models import BufferEntry, ClientSession, PoolState, RouteEntry
 from .persistence import SnapshotStore
 from .protocol import decode_message, encode_message
+from .worker_pool import AutoScalingWorkerPool
 
 try:
     import psutil
@@ -45,6 +46,16 @@ class LatZeroServer:
         self._current_tps = 0.0
         self._request_latencies: Deque[float] = deque(maxlen=100)
 
+        # Auto-scaling worker pool
+        self._worker_pool = AutoScalingWorkerPool(
+            dispatch_fn=self._dispatch,
+            min_workers=self.config.min_workers,
+            max_workers=self.config.max_workers,
+            scale_up_threshold=self.config.scale_up_threshold,
+            scale_down_threshold=self.config.scale_down_threshold,
+            scale_down_hold=self.config.scale_down_hold,
+        )
+
     def _load_snapshots(self) -> None:
         for pool_id, snapshot in self._store.load_pools().items():
             pool = PoolState(
@@ -60,6 +71,9 @@ class LatZeroServer:
         """Start the TCP and WebSocket servers and background cleanup task."""
         if self._tcp_server is not None or self._websocket_server is not None:
             return
+
+        # Start the auto-scaling worker pool first
+        await self._worker_pool.start()
             
         # Start TCP server
         self._tcp_server = await asyncio.start_server(
@@ -80,7 +94,9 @@ class LatZeroServer:
         self._record_event("info", "server_started", extra={
             "host": self.config.host, 
             "tcp_port": self.config.port,
-            "websocket_port": ws_port
+            "websocket_port": ws_port,
+            "min_workers": self.config.min_workers,
+            "max_workers": self.config.max_workers,
         })
 
     async def serve_forever(self) -> None:
@@ -106,6 +122,8 @@ class LatZeroServer:
             self._websocket_server.close()
             await self._websocket_server.wait_closed()
             self._websocket_server = None
+        # Drain the worker pool after servers are closed (no new messages)
+        await self._worker_pool.stop()
 
     async def _cleanup_loop(self) -> None:
         while True:
@@ -163,16 +181,16 @@ class LatZeroServer:
                     raw = await reader.readline()
                     if not raw:
                         break
-                    message = None
                     try:
                         message = decode_message(raw)
-                        await self._dispatch(session, message)
+                        # Submit to the worker pool — non-blocking for the reader
+                        await self._worker_pool.submit(session, message)
                     except Exception as exc:
                         await self._send_message(
                             writer,
                             {
                                 "type": "error",
-                                "request_id": message.get("request_id") if isinstance(message, dict) else None,
+                                "request_id": None,
                                 "client_id": session.client_id,
                                 "pool": session.pool_id,
                                 "payload": {
@@ -205,7 +223,8 @@ class LatZeroServer:
                 try:
                     # WebSocket messages are already strings, parse as JSON
                     message_dict = json.loads(message)
-                    await self._dispatch(session, message_dict)
+                    # Submit to the worker pool — non-blocking for the reader
+                    await self._worker_pool.submit(session, message_dict)
                 except json.JSONDecodeError as exc:
                     await self._send_error(websocket, None, "protocol_error", str(exc))
                     self._record_event(
@@ -892,6 +911,9 @@ class LatZeroServer:
                 }
             )
 
+        # Worker pool stats
+        wp = self._worker_pool.stats
+
         return {
             "host": self.config.host,
             "port": self.config.port,
@@ -908,4 +930,22 @@ class LatZeroServer:
             "memory_rss": memory_rss,
             "pools": pools,
             "events": list(self._event_log),
+            # Auto-scaling worker pool metrics
+            "worker_count": wp.active_workers,
+            "worker_max": wp.max_workers,
+            "worker_min": wp.min_workers,
+            "queue_depth": wp.queue_depth,
+            "worker_tps": wp.messages_per_sec,
+            "scale_events": [
+                {
+                    "timestamp": ev.timestamp,
+                    "direction": ev.direction,
+                    "reason": ev.reason,
+                    "old_count": ev.old_count,
+                    "new_count": ev.new_count,
+                }
+                for ev in wp.scale_events
+            ],
+            "predicted_queue_depth": wp.predicted_depth,
+            "prediction_confidence": wp.prediction_confidence,
         }
