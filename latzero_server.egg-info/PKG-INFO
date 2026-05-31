@@ -6,6 +6,9 @@ Author-email: BRAHMAI <hello@brahmai.in>
 License: MIT
 Requires-Python: >=3.8
 Description-Content-Type: text/markdown
+Requires-Dist: websockets>=12.0
+Provides-Extra: tui
+Requires-Dist: Pillow>=9.0; extra == "tui"
 
 # latzero-server
 

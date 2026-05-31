@@ -26,19 +26,34 @@ class ProcessRegistration:
     Rich registration metadata for a process (scalable or not).
 
     ``processes[process_id]`` maps to this object instead of a raw client_id.
-    For non-scaling registrations there is exactly one replica.
+    Replicas are local workers inside the owning client, not separate TCP
+    connections.  The server tracks aggregate metrics reported by the client.
     """
 
-    process_id: str           # canonical "owner_client_id:process_name"
-    process_name: str         # short name (e.g. "echo")
-    owner_client_id: str      # the client that originally registered
-    group_id: str             # ties all replicas together
-    scale: bool               # eligible for auto-scaling?
-    max_replicas: int         # upper limit (only meaningful when scale=True)
-    replicas: List[ProcessReplica]
+    process_id: str                  # canonical "owner_client_id:process_name"
+    process_name: str                # short name (e.g. "echo")
+    owner_client_id: str             # the client that originally registered
+    group_id: str                    # ties all registrations together
+    scale: bool                      # eligible for auto-scaling?
+    max_replicas: int                # upper limit (only meaningful when scale=True)
     created_at: float
-    rr_index: int = 0
+    rr_index: int = 0                # cross-client round-robin for short-name calls
     last_scale_action: float = 0.0
+
+    # Worker-backend configuration from registration
+    worker_kind: str = "thread"      # "thread" | "process" | "adaptive"
+    min_workers: int = 1
+    max_workers: int = 10
+
+    # Metrics periodically reported by the owning client
+    worker_count: int = 0            # active local workers
+    reported_queue_depth: int = 0    # backlog of calls waiting for a worker
+    reported_avg_latency: float = 0.0
+    reported_completed_count: int = 0
+    last_metrics_at: float = 0.0
+
+    # Retained for backward compatibility (can be empty in new mode)
+    replicas: List[ProcessReplica] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

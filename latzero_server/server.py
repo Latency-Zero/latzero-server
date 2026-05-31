@@ -125,6 +125,7 @@ class LatZeroServer:
             "call_process":       self._handle_call_process,
             "broadcast_process":  self._handle_broadcast_process,
             "list_processes":     self._handle_list_processes,
+            "worker_metrics":     self._handle_worker_metrics,
         }
 
         # ── Metrics ──────────────────────────────────────────────────────
@@ -314,6 +315,9 @@ class LatZeroServer:
         """
         Periodically evaluate scalable processes and send up/down commands.
         Called from _cleanup_loop.
+
+        Uses combined metrics: server-tracked in-flight (backward compat)
+        plus client-reported queue depth for richer scaling decisions.
         """
         now = time.time()
         cfg = self.config
@@ -325,9 +329,10 @@ class LatZeroServer:
                     continue
 
                 total_inflight = sum(r.in_flight for r in reg.replicas)
-                n_replicas = len(reg.replicas)
+                effective_load = total_inflight + reg.reported_queue_depth
+                n_replicas = max(reg.worker_count, len(reg.replicas))
 
-                if total_inflight > cfg.process_scale_up_threshold and n_replicas < reg.max_replicas:
+                if effective_load > cfg.process_scale_up_threshold and n_replicas < reg.max_replicas:
                     reg.last_scale_action = now
                     await self._send_to_client(
                         pool, reg.owner_client_id,
@@ -341,18 +346,24 @@ class LatZeroServer:
                                 "process_name": reg.process_name,
                                 "count": 1,
                                 "group_id": reg.group_id,
-                                "reason": f"high_load ({total_inflight} in-flight)",
+                                "worker_kind": reg.worker_kind,
+                                "min_workers": reg.min_workers,
+                                "max_workers": reg.max_workers,
+                                "reason": (
+                                    f"high_load (inflight={total_inflight}, "
+                                    f"queue={reg.reported_queue_depth})"
+                                ),
                             },
                         },
                     )
                     self._record_event("info", "process_scale_up",
                         pool=pool.pool_id, client_id=reg.owner_client_id,
-                        extra={"process_id": pid, "replicas": n_replicas + 1,
-                               "total_inflight": total_inflight})
+                        extra={"process_id": pid, "workers": n_replicas + 1,
+                               "total_inflight": total_inflight,
+                               "queue_depth": reg.reported_queue_depth})
 
-                elif total_inflight <= cfg.process_scale_down_threshold and n_replicas > 1:
+                elif effective_load <= cfg.process_scale_down_threshold and n_replicas > 1:
                     reg.last_scale_action = now
-                    replica_to_remove = reg.replicas[-1].client_id
                     await self._send_to_client(
                         pool, reg.owner_client_id,
                         {
@@ -365,15 +376,18 @@ class LatZeroServer:
                                 "process_name": reg.process_name,
                                 "count": 1,
                                 "group_id": reg.group_id,
-                                "replica_id": replica_to_remove,
-                                "reason": f"low_load ({total_inflight} in-flight)",
+                                "reason": (
+                                    f"low_load (inflight={total_inflight}, "
+                                    f"queue={reg.reported_queue_depth})"
+                                ),
                             },
                         },
                     )
                     self._record_event("info", "process_scale_down",
                         pool=pool.pool_id, client_id=reg.owner_client_id,
-                        extra={"process_id": pid, "replicas": n_replicas - 1,
-                               "total_inflight": total_inflight})
+                        extra={"process_id": pid, "workers": n_replicas - 1,
+                               "total_inflight": total_inflight,
+                               "queue_depth": reg.reported_queue_depth})
 
     # ======================================================================
     # Connection handlers — thin readers that enqueue, never dispatch inline
@@ -898,6 +912,9 @@ class LatZeroServer:
         scale = payload.get("scale", False)
         max_replicas = payload.get("max_replicas", 10)
         group_id = payload.get("group_id")
+        worker_kind = payload.get("worker_kind", "thread")
+        min_workers = int(payload.get("min_workers", 1))
+        max_workers = int(payload.get("max_workers", 10))
 
         if group_id:
             existing = None
@@ -910,6 +927,8 @@ class LatZeroServer:
                     client_id=session.client_id,
                     created_at=time.time(),
                 ))
+                existing.worker_count = len(existing.replicas)
+                existing.worker_kind = worker_kind
                 process_id = f"{session.client_id}:{process_name}"
                 pool.processes[process_id] = existing
                 await self._ack(session.writer, message, {
@@ -931,6 +950,9 @@ class LatZeroServer:
             group_id=derived_group_id,
             scale=bool(scale),
             max_replicas=int(max_replicas),
+            worker_kind=worker_kind,
+            min_workers=min_workers,
+            max_workers=max_workers,
             replicas=[ProcessReplica(
                 client_id=session.client_id,
                 created_at=time.time(),
@@ -939,14 +961,21 @@ class LatZeroServer:
         )
         pool.processes[process_id] = reg
 
-        ack_payload: dict = {"process_id": process_id, "group_id": derived_group_id}
+        ack_payload: dict = {
+            "process_id": process_id,
+            "group_id": derived_group_id,
+            "worker_kind": worker_kind,
+            "min_workers": min_workers,
+            "max_workers": max_workers,
+        }
         if scale:
             ack_payload["scale"] = True
             ack_payload["max_replicas"] = max_replicas
         await self._ack(session.writer, message, ack_payload)
         self._record_event("info", "process_registered",
             pool=pool.pool_id, client_id=session.client_id,
-            extra={"process_id": process_id, "scale": scale, "group_id": derived_group_id})
+            extra={"process_id": process_id, "scale": scale, "group_id": derived_group_id,
+                   "worker_kind": worker_kind, "min_workers": min_workers, "max_workers": max_workers})
 
     async def _handle_unregister_process(self, session: ClientSession, message: dict) -> None:
         pool = self._require_pool(session, message)
@@ -974,43 +1003,40 @@ class LatZeroServer:
         process_id = payload.get("process_id")
         if not process_id:
             raise ValueError("process_id is required")
-        reg = pool.processes.get(process_id)
-        if reg is None:
-            await self._send_error(session.writer, message, "process_not_found",
-                                   f"Process '{process_id}' is not registered")
-            self._record_event("warn", "process_not_found", pool=pool.pool_id,
-                               client_id=session.client_id, extra={"process_id": process_id})
-            return
 
-        reps = reg.replicas
-        if not reps:
-            await self._send_error(session.writer, message, "process_no_replicas",
-                                   f"Process '{process_id}' has no connected replicas")
-            return
+        # Short-name routing: when process_id has no ':', treat it as a short
+        # process name and do cross-client round-robin across all registrations.
+        if ":" not in process_id:
+            candidates = [
+                reg for reg in pool.processes.values()
+                if reg.process_name == process_id and reg.replicas
+            ]
+            if not candidates:
+                await self._send_error(session.writer, message, "process_not_found",
+                                       f"No process named '{process_id}' is registered in this pool")
+                return
+            idx = (candidates[0].rr_index if len(candidates) == 1
+                   else sum(r.rr_index for r in candidates)) % len(candidates)
+            reg = candidates[idx]
+            reg.rr_index += 1
+            target_client_id = reg.owner_client_id
+            process_id = reg.process_id
+        else:
+            reg = pool.processes.get(process_id)
+            if reg is None:
+                await self._send_error(session.writer, message, "process_not_found",
+                                       f"Process '{process_id}' is not registered")
+                self._record_event("warn", "process_not_found", pool=pool.pool_id,
+                                   client_id=session.client_id, extra={"process_id": process_id})
+                return
+            target_client_id = reg.owner_client_id
 
-        idx = reg.rr_index % len(reps)
-        reg.rr_index += 1
-        target_replica = reps[idx]
-        target_client_id = target_replica.client_id
         target = pool.clients.get(target_client_id)
         if target is None:
-            # Stale replica — remove and retry once
-            reg.replicas = [r for r in reps if r.client_id != target_client_id]
-            reps = reg.replicas
-            if not reps:
-                await self._send_error(session.writer, message, "process_no_replicas",
-                                       f"Process '{process_id}' has no connected replicas")
-                return
-            idx = 0
-            target_replica = reps[0]
-            target_client_id = target_replica.client_id
-            target = pool.clients.get(target_client_id)
-            if target is None:
-                await self._send_error(session.writer, message, "process_owner_offline",
-                                       f"No replicas online for process '{process_id}'")
-                return
+            await self._send_error(session.writer, message, "process_owner_offline",
+                                   f"Owner '{target_client_id}' for process '{process_id}' is not connected")
+            return
 
-        target_replica.in_flight += 1
         request_id = message.get("request_id") or _next_id()
         timeout = payload.get("timeout")
         response_client_id = payload.get("response_to") or session.client_id
@@ -1027,7 +1053,6 @@ class LatZeroServer:
         pool.in_flight_requests[request_id] = route
 
         # Two synchronous writes — zero event-loop yields, zero Task allocations.
-        # drain() is skipped (see _write_nowait); the kernel handles delivery.
         self._write_nowait(target.writer, {
             "type": "call_app",
             "request_id": request_id,
@@ -1110,7 +1135,7 @@ class LatZeroServer:
         pool = self._require_pool(session, message)
         payload = message.get("payload") or {}
         pattern = payload.get("pattern")
-        processes: Dict[str, str] = {}
+        processes: Dict[str, dict] = {}
         for pid, reg in pool.processes.items():
             for rep in reg.replicas:
                 rep_pid = f"{rep.client_id}:{reg.process_name}"
@@ -1119,8 +1144,53 @@ class LatZeroServer:
                     if not rep_pid.startswith(prefix):
                         continue
                 if rep_pid not in processes:
-                    processes[rep_pid] = rep.client_id
+                    processes[rep_pid] = {
+                        "client_id": rep.client_id,
+                        "process_name": reg.process_name,
+                        "worker_kind": reg.worker_kind,
+                        "worker_count": reg.worker_count or len(reg.replicas),
+                        "queue_depth": reg.reported_queue_depth,
+                        "avg_latency": reg.reported_avg_latency,
+                        "completed_count": reg.reported_completed_count,
+                    }
         await self._ack(session.writer, message, {"processes": processes})
+
+    async def _handle_worker_metrics(self, session: ClientSession, message: dict) -> None:
+        """
+        Receive periodic worker metrics from a client.
+
+        Payload format::
+            {
+                "metrics": [
+                    {
+                        "process_name": str,
+                        "active_workers": int,
+                        "queue_depth": int,
+                        "avg_latency": float,
+                        "completed_count": int,
+                    },
+                    ...
+                ]
+            }
+        """
+        pool = self._require_pool(session, message)
+        payload = message.get("payload") or {}
+        metrics_list = payload.get("metrics", [])
+        now = time.time()
+        for m in metrics_list:
+            pname = m.get("process_name")
+            if not pname:
+                continue
+            pid = f"{session.client_id}:{pname}"
+            reg = pool.processes.get(pid)
+            if reg is None:
+                continue
+            reg.worker_count = m.get("active_workers", reg.worker_count)
+            reg.reported_queue_depth = m.get("queue_depth", 0)
+            reg.reported_avg_latency = m.get("avg_latency", 0.0)
+            reg.reported_completed_count = m.get("completed_count", reg.reported_completed_count)
+            reg.last_metrics_at = now
+        await self._ack(session.writer, message, {"received": len(metrics_list)})
 
     # ======================================================================
     # Disconnect / cleanup

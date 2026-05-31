@@ -9,9 +9,11 @@ latzero_server/persistence.py
 latzero_server/protocol.py
 latzero_server/server.py
 latzero_server/tui.py
+latzero_server/worker_pool.py
 latzero_server.egg-info/PKG-INFO
 latzero_server.egg-info/SOURCES.txt
 latzero_server.egg-info/dependency_links.txt
 latzero_server.egg-info/entry_points.txt
+latzero_server.egg-info/requires.txt
 latzero_server.egg-info/top_level.txt
 tests/test_persistence.py
