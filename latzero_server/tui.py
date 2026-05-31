@@ -591,7 +591,7 @@ class ServerDashboard:
     def _r_workers(self, snap: dict) -> FT:
         """Render the Workers auto-scaling pane."""
         worker_count = snap.get("worker_count", 0)
-        worker_max   = snap.get("worker_max", 128)
+        worker_max   = snap.get("worker_max", 1280)
         worker_min   = snap.get("worker_min", 4)
         scale_events = snap.get("scale_events", [])
         predicted    = snap.get("predicted_queue_depth", 0.0)

@@ -3,7 +3,47 @@ Data models for latzero-server runtime state.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, List, Optional, Set
+
+
+# ---------------------------------------------------------------------------
+# Process auto-scaling models
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ProcessReplica:
+    """A single replica of a scalable registered process."""
+
+    client_id: str
+    created_at: float
+    in_flight: int = 0
+
+
+@dataclass
+class ProcessRegistration:
+    """
+    Rich registration metadata for a process (scalable or not).
+
+    ``processes[process_id]`` maps to this object instead of a raw client_id.
+    For non-scaling registrations there is exactly one replica.
+    """
+
+    process_id: str           # canonical "owner_client_id:process_name"
+    process_name: str         # short name (e.g. "echo")
+    owner_client_id: str      # the client that originally registered
+    group_id: str             # ties all replicas together
+    scale: bool               # eligible for auto-scaling?
+    max_replicas: int         # upper limit (only meaningful when scale=True)
+    replicas: List[ProcessReplica]
+    created_at: float
+    rr_index: int = 0
+    last_scale_action: float = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Original models
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -50,6 +90,7 @@ class RouteEntry:
     event: str
     created_at: float
     expires_at: Optional[float] = None
+    process_registration_id: Optional[str] = None  # for in_flight tracking on scalable processes
 
 
 @dataclass
@@ -63,8 +104,8 @@ class PoolState:
     subscriptions: Dict[str, Set[str]] = field(default_factory=dict)
     clients: Dict[str, "ClientSession"] = field(default_factory=dict)
     in_flight_requests: Dict[str, RouteEntry] = field(default_factory=dict)
-    # Process pool: maps "client_id:process_name" -> client_id
-    processes: Dict[str, str] = field(default_factory=dict)
+    # Process pool: maps canonical "owner_client_id:process_name" → ProcessRegistration
+    processes: Dict[str, "ProcessRegistration"] = field(default_factory=dict)
 
     def snapshot(self) -> dict:
         return {

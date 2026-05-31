@@ -5,17 +5,27 @@ Architecture:
     [Reader 1] ──┐
     [Reader 2] ──┤    ┌───────────────────┐    ┌──────────────────┐
     [Reader N] ──┼──→ │  Dispatch Queue   │ ──→│  Worker Pool     │
-                 └──── │  (asyncio.Queue)  │    │  4–128 Tasks     │
+                 └──── │  (asyncio.Queue)  │    │  4–1280 Tasks     │
                        └───────────────────┘    └──────────────────┘
                                                         ↑
                                                Auto-Scaling Controller
-                                               (queue depth + predictor)
+                                               (proportional + predictive)
 
-Scale-up:   queue depth > scale_up_threshold  → add 2 workers immediately
-Scale-down: queue depth < scale_down_threshold for scale_down_hold seconds
-            → drain one worker at a time
-Predictive: 30-second rolling window + linear regression → pre-scale when
-            forecast indicates depth will exceed threshold within 10 seconds
+Scaling algorithm
+-----------------
+The controller runs every 0.25 s (4×/s) and applies THREE layers:
+
+  1. Emergency burst  — queue > 5× threshold  → jump immediately to
+                        min(current + burst_size, max_workers)
+  2. Proportional    — queue between threshold and 5×  → add workers
+                        proportional to queue/threshold, capped by
+                        max_step_up per tick.
+  3. Predictive      — linear regression on 15-s rolling window predicts
+                        depth 5 s ahead.  If forecast > threshold, pre-scale
+                        proportionally (confidence >= 0.3 required, not 0.6).
+
+Scale-down: queue < scale_down_threshold sustained for scale_down_hold
+            seconds → drain one worker at a time (conservative).
 """
 
 import asyncio
@@ -44,7 +54,7 @@ class ScaleEvent:
 class WorkerPoolStats:
     """Live metrics snapshot exposed to the TUI and dashboard."""
     active_workers: int = 0
-    max_workers: int = 128
+    max_workers: int = 1280
     min_workers: int = 4
     queue_depth: int = 0
     messages_processed: int = 0
@@ -66,9 +76,13 @@ class LoadPredictor:
     Maintains a rolling window of (timestamp, queue_depth) samples.
     Provides a forecast of the queue depth N seconds in the future,
     along with a confidence score based on r².
+
+    Tuned for responsiveness: 15-second window, 5-second horizon,
+    minimum confidence threshold dropped to 0.3 so it activates quickly
+    under bursty load rather than waiting for a smooth trend.
     """
 
-    def __init__(self, window_seconds: float = 30.0, forecast_horizon: float = 10.0):
+    def __init__(self, window_seconds: float = 15.0, forecast_horizon: float = 5.0):
         self._window = window_seconds
         self._horizon = forecast_horizon
         self._samples: Deque[Tuple[float, float]] = deque()
@@ -140,17 +154,29 @@ class AutoScalingWorkerPool:
 
     Workers are ephemeral asyncio Tasks — zero process spawn overhead.
     Readers are never blocked by dispatch; they enqueue and move on.
+
+    Scaling layers (applied every controller_interval seconds):
+      1. Emergency burst  — depth > 5 × threshold → add burst_size workers
+      2. Proportional     — depth > threshold → add ceil(depth/threshold) workers
+      3. Predictive       — forecast > threshold (conf >= 0.3) → pre-scale proportionally
+      4. Gradual drain    — depth < down_threshold sustained → -1 worker
     """
 
     def __init__(
         self,
         dispatch_fn: Callable[..., Coroutine],
         min_workers: int = 4,
-        max_workers: int = 128,
+        max_workers: int = 1280,
         scale_up_threshold: int = 50,
         scale_down_threshold: int = 5,
         scale_down_hold: float = 10.0,
-        controller_interval: float = 1.0,
+        # How often the controller wakes up (4×/s for fast reaction)
+        controller_interval: float = 0.25,
+        # Max workers to add per tick in the proportional layer
+        max_step_up: int = 32,
+        # Workers to add in one shot when depth > emergency_multiplier × threshold
+        burst_size: int = 64,
+        emergency_multiplier: float = 5.0,
     ):
         self._dispatch_fn = dispatch_fn
         self._min_workers = min_workers
@@ -159,6 +185,9 @@ class AutoScalingWorkerPool:
         self._scale_down_threshold = scale_down_threshold
         self._scale_down_hold = scale_down_hold
         self._controller_interval = controller_interval
+        self._max_step_up = max_step_up
+        self._burst_size = burst_size
+        self._emergency_multiplier = emergency_multiplier
 
         # The shared message queue (unbounded — readers never block)
         self._queue: asyncio.Queue[Any] = asyncio.Queue()
@@ -240,6 +269,7 @@ class AutoScalingWorkerPool:
                     return  # Clean exit
                 session, message = item
                 self._msg_counter += 1
+                self._stats.messages_processed += 1
                 try:
                     await self._dispatch_fn(session, message)
                 except Exception:
@@ -250,14 +280,15 @@ class AutoScalingWorkerPool:
                 self._queue.task_done()
 
     # ------------------------------------------------------------------
-    # Auto-scaling controller
+    # Auto-scaling controller  (runs every controller_interval seconds)
     # ------------------------------------------------------------------
 
     async def _scale_controller(self) -> None:
-        """Periodically inspect queue depth and scale the worker pool."""
+        """Inspect queue depth every tick and apply the three-layer scaling policy."""
         while True:
             await asyncio.sleep(self._controller_interval)
             self._update_stats()
+
             depth = self._queue.qsize()
             self._predictor.record(float(depth))
             predicted, confidence = self._predictor.predict()
@@ -266,25 +297,60 @@ class AutoScalingWorkerPool:
 
             n = len(self._workers)
 
-            # --- Predictive pre-scaling ---
-            # If high confidence and forecast says we'll exceed threshold soon
+            # ── Layer 1: Emergency burst ─────────────────────────────────
+            # Queue is critically deep (> N× threshold). Spawn a large batch
+            # of workers immediately to catch up, instead of trickling +2.
+            emergency_level = self._scale_up_threshold * self._emergency_multiplier
+            if depth > emergency_level and n < self._max_workers:
+                to_add = min(self._burst_size, self._max_workers - n)
+                self._scale_up(
+                    to_add,
+                    reason=(
+                        f"emergency: queue {depth} > "
+                        f"{emergency_level:.0f} ({self._emergency_multiplier:.0f}× threshold)"
+                    ),
+                )
+                continue  # Re-evaluate on next tick
+
+            # ── Layer 2: Proportional reactive scale-up ──────────────────
+            # Add workers proportional to how overloaded the queue is.
+            # ratio=1  → at threshold      → add 1
+            # ratio=2  → 2× threshold      → add 2
+            # ratio=5  → 5× threshold      → add max_step_up
+            if depth > self._scale_up_threshold and n < self._max_workers:
+                ratio = depth / self._scale_up_threshold
+                step = min(int(ratio), self._max_step_up)
+                step = max(step, 2)  # Always at least 2 (same as before for small overload)
+                self._scale_up(
+                    step,
+                    reason=(
+                        f"proportional: queue {depth} "
+                        f"({ratio:.1f}× threshold) → +{step}"
+                    ),
+                )
+                continue
+
+            # ── Layer 3: Predictive pre-scale ────────────────────────────
+            # Forecast says depth will exceed threshold within the horizon.
+            # Lower confidence threshold (0.3) to activate quickly under
+            # bursty load, not just during smooth steady-state ramps.
             if (
-                confidence > 0.6
+                confidence >= 0.3
                 and predicted > self._scale_up_threshold
                 and n < self._max_workers
             ):
+                ratio = predicted / self._scale_up_threshold
+                step = min(max(int(ratio), 1), self._max_step_up)
                 self._scale_up(
-                    2,
-                    reason=f"predictive: forecast depth {predicted:.0f} > {self._scale_up_threshold}",
+                    step,
+                    reason=(
+                        f"predictive: forecast {predicted:.0f} > "
+                        f"{self._scale_up_threshold} (conf {confidence:.2f}) → +{step}"
+                    ),
                 )
-                continue  # Re-evaluate next tick
-
-            # --- Reactive scale-up ---
-            if depth > self._scale_up_threshold and n < self._max_workers:
-                self._scale_up(2, reason=f"reactive: queue depth {depth} > {self._scale_up_threshold}")
                 continue
 
-            # --- Scale-down (sustained low depth) ---
+            # ── Layer 4: Gradual drain ───────────────────────────────────
             if depth < self._scale_down_threshold and n > self._min_workers:
                 now = time.monotonic()
                 if self._stats.low_depth_since is None:
@@ -292,11 +358,13 @@ class AutoScalingWorkerPool:
                 elif (now - self._stats.low_depth_since) >= self._scale_down_hold:
                     self._scale_down(
                         1,
-                        reason=f"idle: queue depth {depth} < {self._scale_down_threshold} for {self._scale_down_hold:.0f}s",
+                        reason=(
+                            f"idle: queue {depth} < {self._scale_down_threshold} "
+                            f"for {self._scale_down_hold:.0f}s"
+                        ),
                     )
-                    self._stats.low_depth_since = None  # Reset timer after each drain step
+                    self._stats.low_depth_since = None
             else:
-                # Reset low-depth timer if depth is no longer low
                 self._stats.low_depth_since = None
 
     # ------------------------------------------------------------------
@@ -353,7 +421,6 @@ class AutoScalingWorkerPool:
 
         self._stats.active_workers = len(self._workers)
         self._stats.queue_depth = self._queue.qsize()
-        self._stats.messages_processed += 0  # cumulative tracked separately
         self._stats.scale_events = list(self._scale_events)
 
     @property
