@@ -126,6 +126,7 @@ class LatZeroServer:
             "broadcast_process":  self._handle_broadcast_process,
             "list_processes":     self._handle_list_processes,
             "worker_metrics":     self._handle_worker_metrics,
+            "list_clients":       self._handle_list_clients,
         }
 
         # ── Metrics ──────────────────────────────────────────────────────
@@ -1154,6 +1155,10 @@ class LatZeroServer:
                         "completed_count": reg.reported_completed_count,
                     }
         await self._ack(session.writer, message, {"processes": processes})
+
+    async def _handle_list_clients(self, session: ClientSession, message: dict) -> None:
+        pool = self._require_pool(session, message)
+        await self._ack(session.writer, message, {"clients": sorted(pool.clients.keys())})
 
     async def _handle_worker_metrics(self, session: ClientSession, message: dict) -> None:
         """
