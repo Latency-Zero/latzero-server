@@ -312,6 +312,8 @@ def test_build_uses_unique_assets_and_preserves_checkout_files(build_env, monkey
         for name in ("lat.png", "logo.png", "README.md", "pyproject.toml"):
             assert str(state.root / name) + os.pathsep + "." in resources
         assert "latzero_server.tui" in args
+        assert "latzero_server.pods" in args
+        assert "latzero_server.directory_lock" in args
         assert "websockets.legacy.server" in args
         assert "--copy-metadata" in args
 

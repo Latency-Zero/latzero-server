@@ -246,7 +246,8 @@ class LatZeroServer:
             if self._pool_routing is None:
                 from .directory_lock import DataDirectoryLock
 
-                self._directory_lock = DataDirectoryLock(self.config.data_dir).acquire()
+                if self._directory_lock is None:
+                    self._directory_lock = DataDirectoryLock(self.config.data_dir).acquire()
                 # Constructor inspection is read-only state. Re-capture under
                 # ownership before opening listeners so a preconstructed daemon
                 # cannot start from snapshots changed by a previous owner.

@@ -102,7 +102,9 @@ async def _run(args: argparse.Namespace) -> None:
         await server.start()
 
         if not args.tui:
-            port = server.tcp_port if pods != 1 else server._tcp_server.sockets[0].getsockname()[1]
+            port = server.tcp_port if pods != 1 else config.port
+            if pods == 1 and config.port == 0:
+                port = server._tcp_server.sockets[0].getsockname()[1]
             print(
                 f"latzero-server listening on {config.host}:{port} "
                 f"(pods: {pods}, data-dir: {config.data_dir})",

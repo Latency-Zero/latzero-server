@@ -1,6 +1,4 @@
 import asyncio
-import json
-from types import SimpleNamespace
 
 import pytest
 from websockets.legacy.client import connect as connect_ws
