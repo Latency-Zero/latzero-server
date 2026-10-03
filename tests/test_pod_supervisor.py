@@ -257,6 +257,50 @@ async def test_stop_escalation_handles_actual_runtime_not_only_venv_launcher(tmp
 
 
 @pytest.mark.asyncio
+async def test_exit_notification_race_does_not_report_forced_shutdown(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from latzero_server.pods import PodChild
+
+    supervisor = PodSupervisor(_config(tmp_path, websocket_enabled=False), 2)
+    loop = asyncio.get_running_loop()
+    stopped = loop.create_future()
+    stopped.set_result({"stopped": True, "ok": True, "index": 0})
+
+    class Process:
+        def __init__(self):
+            self.returncode = None
+            self.stdin = SimpleNamespace(close=lambda: None)
+            self.terminated = False
+            self.waits = 0
+
+        def discover_runtimes(self):
+            pass
+
+        async def wait(self):
+            self.waits += 1
+            if self.waits == 1:
+                self.returncode = 0
+                raise asyncio.TimeoutError()
+            return self.returncode
+
+        def terminate(self):
+            self.terminated = True
+            return True
+
+    process = Process()
+    child = PodChild(index=0, process=process, _stopped=stopped)
+    child._stdout_eof = child._stderr_eof = True
+
+    async def sent(*args):
+        pass
+
+    monkeypatch.setattr(supervisor, "_send_control", sent)
+    await supervisor._stop_child(child, loop.time() + 1)
+    assert not process.terminated
+    assert child._reaped and child.status == "stopped"
+
+
+@pytest.mark.asyncio
 async def test_pre_ready_control_failure_discovers_and_reaps_runtime(tmp_path, monkeypatch):
     import latzero_server.pods as module
 

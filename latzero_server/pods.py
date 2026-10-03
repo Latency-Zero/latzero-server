@@ -202,9 +202,12 @@ class _WindowsProcess:
             raise OSError("Cannot determine process exit code")
         return int(code.value)
 
-    def terminate(self) -> None:
-        if self.alive() and not self.kernel.TerminateProcess(self.handle, 1):
+    def terminate(self) -> bool:
+        if not self.alive():
+            return False
+        if not self.kernel.TerminateProcess(self.handle, 1):
             raise OSError("Cannot terminate process {}".format(self.pid))
+        return True
 
     def close(self) -> None:
         if self.handle is not None:
@@ -333,14 +336,20 @@ class _PodProcess:
             await asyncio.sleep(0.05)
         return self.returncode
 
-    def terminate(self) -> None:
+    def terminate(self) -> bool:
         self.discover_runtimes()
+        terminated = False
         if self.runtime is not None:
-            self.runtime.terminate()
+            terminated = self.runtime.terminate() or terminated
         for handle in self._extra_runtimes.values():
-            handle.terminate()
+            terminated = handle.terminate() or terminated
         if self.launcher.returncode is None:
-            self.launcher.terminate()
+            try:
+                self.launcher.terminate()
+                terminated = True
+            except ProcessLookupError:
+                pass
+        return terminated
 
     def kill(self) -> None:
         self.discover_runtimes()
@@ -1011,9 +1020,11 @@ class PodSupervisor:
             try:
                 await asyncio.wait_for(process.wait(), self._remaining(grace))
             except asyncio.TimeoutError:
-                escalated = True
-                with suppress(ProcessLookupError, OSError):
-                    process.terminate()
+                # A wait can expire while exit notification is already queued.
+                # Record escalation only when a live process was signalled.
+                if process.returncode is None:
+                    with suppress(ProcessLookupError, OSError):
+                        escalated = process.terminate() is not False
                 try:
                     await asyncio.wait_for(process.wait(), self._remaining(grace + _REAP_TIMEOUT))
                 except asyncio.TimeoutError:
