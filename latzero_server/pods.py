@@ -258,16 +258,17 @@ class _PodProcess:
     def __init__(self, process: Any):
         self.launcher = process
         self.runtime = None
+        self._pid = process.pid
         self._runtime_code = None
 
     @property
     def pid(self) -> int:
-        return self.runtime.pid if self.runtime is not None else self.launcher.pid
+        return self._pid
 
     @property
     def returncode(self) -> Optional[int]:
         if self._runtime_code is not None:
-            return self._runtime_code or self.launcher.returncode if self.launcher.returncode is not None else None
+            return (self._runtime_code or self.launcher.returncode) if self.launcher.returncode is not None else None
         if self.runtime is not None:
             code = self.runtime.returncode
             if code is None or self.launcher.returncode is None:
@@ -282,6 +283,7 @@ class _PodProcess:
             raise ValueError("Pod runtime is not a child of its launcher")
         if os.name == "nt" and self.runtime is None:
             self.runtime = _WindowsProcess(pid, terminate=True)
+        self._pid = pid
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.launcher, name)
@@ -796,7 +798,10 @@ class PodSupervisor:
                 protocol.transport.close()
 
     async def serve_forever(self) -> None:
-        await self.start()
+        if not self._started:
+            if self._health_error:
+                raise RuntimeError(self._health_error)
+            await self.start()
         await self._closed.wait()
         if self._health_error:
             raise RuntimeError(self._health_error)
@@ -818,15 +823,20 @@ class PodSupervisor:
 
     async def _stop(self) -> None:
         self._stopping = True
-        self._seal_ingress()
+        errors = []
+        try:
+            self._seal_ingress()
+        except Exception as exc:
+            errors.append(str(exc))
         if self._health_task is not None:
             self._health_task.cancel()
         grace = asyncio.get_running_loop().time() + _STOP_GRACE
         outcomes = await asyncio.gather(self._stop_router(grace), *(self._stop_child(child, grace) for child in self.children),
                                         return_exceptions=True)
-        errors = [str(outcome) for outcome in outcomes if isinstance(outcome, BaseException)]
+        errors.extend(str(outcome) for outcome in outcomes if isinstance(outcome, BaseException))
         if self._health_task is not None:
-            done, pending = await asyncio.wait([self._health_task], timeout=min(1.0, self._remaining(grace + 2 * _REAP_TIMEOUT)))
+            done, pending = await asyncio.wait([self._health_task], timeout=max(0.0, min(
+                1.0, grace + 2 * _REAP_TIMEOUT - asyncio.get_running_loop().time())))
             if pending:
                 errors.append("Pod health task did not stop")
             for task in done:
@@ -836,14 +846,20 @@ class PodSupervisor:
         reaped = not self._creations and all(child.process is None or child.process.returncode is not None
                                            and child._stdout_eof and child._stderr_eof for child in self.children)
         if reaped and self._directory_lock is not None:
-            self._directory_lock.release()
-            self._directory_lock = None
+            try:
+                self._directory_lock.release()
+                self._directory_lock = None
+            except Exception as exc:
+                errors.append(str(exc))
         elif not reaped:
             errors.append("Unreaped pods retain the directory lease")
         if reaped:
             for child in self.children:
                 if child.process is not None:
-                    child.process.release_handle()
+                    try:
+                        child.process.release_handle()
+                    except Exception as exc:
+                        errors.append(str(exc))
         self._started = False
         if self._closed is not None:
             self._closed.set()
@@ -1006,6 +1022,8 @@ class _ParentProcess:
         self.pid = pid
         self.handle = None
         if os.name == "nt":
+            if not _windows_descendant(os.getpid(), pid):
+                raise RuntimeError("Configured parent is not an ancestor of this pod")
             self.handle = _WindowsProcess(pid)
         if not self.alive():
             self.close()

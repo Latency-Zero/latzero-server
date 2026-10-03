@@ -2,17 +2,29 @@
 
 import asyncio
 import hashlib
+import importlib
+import importlib.machinery
 import json
 import os
+import queue
+import shutil
 import signal
 import socket
+import sys
+import types
+from contextlib import asynccontextmanager
+from pathlib import Path
 
 import pytest
 from websockets.exceptions import InvalidStatusCode
 
 from latzero_server.config import ServerConfig
 from latzero_server.server import LatZeroServer
-from pod_fixture import PodCluster, assert_listener_closed, pod_cluster, pools_for_owners, reference_owner
+from pod_fixture import PodCluster, assert_listener_closed, blocking, pod_cluster, pools_for_owners, reference_owner
+
+
+ROOT = Path(__file__).resolve().parents[2]
+SDK_HELPER = Path(__file__).with_name("interop_pods.cjs")
 
 
 def canonical_path(root, pool):
@@ -86,6 +98,8 @@ async def test_same_pool_public_tcp_and_ws_connections_have_one_real_owner(tmp_p
             assert item["pid"] == cluster.children[index].pid and item["pod_index"] == index
             assert item["connections"] == (4 if index == owner.index else 0)
             assert item["pools"] == (1 if index == owner.index else 0)
+            assert item["pool_ids"] == ([pool] if index == owner.index else [])
+            assert item["pool_ids_truncated"] is False
             assert item["health_error"] is None
             assert item["persistence"]["healthy"] is True and item["persistence"]["running"] is True
             assert isinstance(item["metrics"]["received"], int)
@@ -136,6 +150,7 @@ async def test_four_owner_pools_isolate_membership_buffers_subscriptions_and_rou
         stats = await cluster.refresh_stats()
         for index, item in enumerate(stats):
             assert item["pools"] == 1 and item["connections"] == 3
+            assert item["pool_ids"] == [pools[index][0]] and item["pool_ids_truncated"] is False
             assert item["metrics"]["accepted_calls"] == item["metrics"]["completed_calls"] == 2
             assert item["health_error"] is None and item["persistence"]["healthy"] is True
             assert item["pid"] == cluster.children[index].pid
@@ -296,6 +311,8 @@ async def test_persistent_flat_hash_snapshots_auth_and_ttl_survive_two_to_four_p
         stats = await second.refresh_stats()
         for index, item in enumerate(stats):
             assert item["pools"] == sum(reference_owner(pool, 4) == index for pool in pools)
+            assert item["pool_ids"] == sorted(pool for pool in pools if reference_owner(pool, 4) == index)
+            assert item["pool_ids_truncated"] is False
             assert item["pid"] == second.children[index].pid
     assert {path: path.read_bytes() for path in expected_paths} == original_bytes
     assert set(tmp_path.glob("*.json")) == expected_paths
@@ -616,6 +633,8 @@ async def test_stopping_supervisor_reaps_children_and_closes_tcp_ws_ports(tmp_pa
         ports = [cluster.tcp_port, cluster.ws_port]
         for child in cluster.children:
             ports.extend((child.port, child.ws_port))
+        await tcp.hello()
+        await ws.hello()
         await asyncio.wait_for(cluster.supervisor.stop(), 30)
         await tcp.expect_closed()
         await ws.expect_closed()
@@ -628,6 +647,38 @@ async def test_stopping_supervisor_reaps_children_and_closes_tcp_ws_ports(tmp_pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["tcp", "ws"])
+async def test_router_tiny_session_budget_rejects_control_flood_before_join(tmp_path, transport):
+    async with pod_cluster(tmp_path, 2, max_session_messages=2) as cluster:
+        peer = await cluster.open(transport)
+        await peer.hello()
+        await peer.hello()
+        await peer.send(peer.message("hello", {"capabilities": ["pool_redirect_v1"]}, "over-budget"))
+        error = await peer.receive("error")
+        assert error["payload"]["code"] == "overloaded"
+        await peer.expect_closed()
+        assert not list(tmp_path.glob("*.json"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["tcp", "ws"])
+async def test_router_oversized_redirect_returns_small_correlated_error_without_state(tmp_path, transport):
+    async with pod_cluster(tmp_path, 2, max_frame_bytes=1024) as cluster:
+        peer = await cluster.open(transport)
+        await peer.hello()
+        pool = "p" * 300
+        request_id = "r" * 300
+        message = peer.message("join_pool", {"client_id": "small-response", "pool": pool}, request_id)
+        assert len(json.dumps(message, separators=(",", ":")).encode("utf-8")) <= 1024
+        await peer.send(message)
+        error = await peer.receive("error", request_id)
+        assert error["payload"]["code"] == "response_too_large"
+        assert len(json.dumps(error, separators=(",", ":")).encode("utf-8")) <= 1024
+        await peer.expect_closed()
+        assert not canonical_path(tmp_path, pool).exists()
+
+
+@pytest.mark.asyncio
 async def test_disabled_websocket_redirect_metadata_uses_null_ports(tmp_path):
     async with pod_cluster(tmp_path, 2, websocket_enabled=False) as cluster:
         assert cluster.ws_port is None and all(child.ws_port is None for child in cluster.children)
@@ -637,3 +688,192 @@ async def test_disabled_websocket_redirect_metadata_uses_null_ports(tmp_path):
         assert peer.redirects[0]["payload"]["router_ws_port"] is None
         await peer.ack("set_buffer", {"key": "value", "value": "tcp"})
         assert (await get_value(peer, "value"))["entry"]["value"] == "tcp"
+
+
+class PodSdkProcess:
+    def __init__(self, process):
+        self.process = process
+        self.stderr = asyncio.create_task(process.stderr.read())
+        self.sequence = 0
+
+    async def receive(self):
+        raw = await asyncio.wait_for(self.process.stdout.readline(), 30)
+        assert raw, "Pod SDK helper exited without a response (exit=%r)" % self.process.returncode
+        response = json.loads(raw)
+        assert response.get("ok"), "Pod SDK helper failed: %s\n%s" % (response.get("error"), response.get("stack", ""))
+        return response
+
+    async def command(self, operation, **options):
+        self.sequence += 1
+        request = dict(options, id=self.sequence, operation=operation)
+        self.process.stdin.write((json.dumps(request) + "\n").encode("utf-8"))
+        await asyncio.wait_for(self.process.stdin.drain(), 3)
+        response = await self.receive()
+        assert response["id"] == self.sequence
+        return response["result"]
+
+    async def close(self, failed):
+        try:
+            if self.process.returncode is None:
+                if failed:
+                    self.process.stdin.close()
+                else:
+                    await self.command("shutdown")
+                try:
+                    await asyncio.wait_for(self.process.wait(), 8)
+                except asyncio.TimeoutError:
+                    self.process.kill()
+                    await asyncio.wait_for(self.process.wait(), 5)
+            stderr = await asyncio.wait_for(self.stderr, 3)
+            if not failed:
+                assert self.process.returncode == 0, stderr.decode("utf-8", errors="replace")
+                assert not stderr, stderr.decode("utf-8", errors="replace")
+        finally:
+            if self.process.returncode is None:
+                self.process.kill()
+                await asyncio.wait_for(self.process.wait(), 5)
+            self.process.stdin.close()
+            if not self.stderr.done():
+                self.stderr.cancel()
+                await asyncio.gather(self.stderr, return_exceptions=True)
+
+
+@asynccontextmanager
+async def real_pod_sdks(cluster, pool, fmt, api):
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Pod SDK integration requires Node with native WebSocket")
+    for path in (ROOT / "node-client" / "index.js", ROOT / "node-client" / "index.cjs",
+                 ROOT / "web-client" / "latzero-client.js"):
+        if not path.is_file():
+            pytest.skip("Pod SDK integration requires sibling checkout %s" % path)
+    options = {"root": str(ROOT), "port": cluster.tcp_port, "wsPort": cluster.ws_port,
+               "pool": pool, "format": fmt, "api": api}
+    process = await asyncio.create_subprocess_exec(
+        node, "--unhandled-rejections=strict", str(SDK_HELPER), json.dumps(options),
+        cwd=str(SDK_HELPER.parent), stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, limit=1024 * 1024,
+    )
+    helper = PodSdkProcess(process)
+    failed = True
+    try:
+        ready = await helper.receive()
+        assert ready["ready"] is True
+        yield helper, ready
+        failed = False
+    finally:
+        await helper.close(failed)
+
+
+@pytest.fixture
+def pod_python_sdk():
+    source = ROOT / "python-client" / "latzero"
+    if not (source / "server_client.py").is_file():
+        pytest.skip("Pod integration requires the sibling Python daemon SDK")
+    name = "_latzero_pod_integration_sdk"
+    package = types.ModuleType(name)
+    package.__path__ = [str(source)]
+    package.__spec__ = importlib.machinery.ModuleSpec(name, loader=None, is_package=True)
+    sys.modules[name] = package
+    try:
+        yield importlib.import_module(name + ".server_client").LatZero
+    finally:
+        for module in list(sys.modules):
+            if module == name or module.startswith(name + "."):
+                del sys.modules[module]
+
+
+@pytest.mark.skipif(os.environ.get("LATZERO_POD_SDK_INTEROP") != "1",
+                    reason="Set LATZERO_POD_SDK_INTEROP=1 to run real Python/Node/browser pod integration")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fmt,api", [(fmt, api) for fmt in ("esm", "cjs") for api in ("default", "async")])
+async def test_real_python_node_browser_sdks_follow_pool_owner_and_switch_without_replay(tmp_path, fmt, api, pod_python_sdk):
+    python = None
+    async with pod_cluster(tmp_path, 4, persistence_batch_window=0.01) as cluster:
+        pools = pools_for_owners(4, "real-sdk")
+        pool, target_pool = pools[0][0], pools[1][0]
+        target, _ = await cluster.join("target-peer", target_pool, auth_token="target-token")
+        async with real_pod_sdks(cluster, pool, fmt, api) as (helper, ready):
+            owner = cluster.children[0]
+            for client_id, endpoint in ready["endpoints"].items():
+                assert endpoint["port"] == (owner.ws_port if client_id == "browser-main" else owner.port)
+                assert endpoint["host"] == "127.0.0.1" and endpoint["configuredPort"] == cluster.tcp_port
+                assert endpoint["pool"] == pool and endpoint["clientId"] == client_id
+                if client_id == "browser-main":
+                    assert endpoint["configuredWsPort"] == cluster.ws_port
+            rpc = await helper.command("rpc")
+            assert len(rpc["results"]) == 8 and len(set(rpc["results"])) == 8
+            assert len(rpc["routed"]) == 6 and len({route["request_id"] for route in rpc["routed"]}) == 6
+            assert await helper.command("buffers") == {"writers": 3, "subscribers": 3, "updates": 9}
+            try:
+                python = await blocking(pod_python_sdk, "latzero://python-main", pool, port=cluster.tcp_port,
+                                        timeout=8, callback_workers=1)
+                assert python.client_id == "python-main" and python.pool_name == pool
+                assert python._socket.getpeername()[1] == owner.port
+                assert python._host == "127.0.0.1" and python._port == cluster.tcp_port
+
+                def calculate(a, b):
+                    return {"owner": "python-main", "kind": "app", "value": a + b}
+
+                def compute(a, b):
+                    return {"owner": "python-main", "kind": "process", "value": a + b}
+
+                python.on_event("calculate")(calculate)
+                await blocking(python.process.register, compute, min_workers=1, max_workers=1)
+                hooks = queue.Queue(maxsize=16)
+                python.on("on_app_result", hooks.put)
+                await blocking(python.set, "from-python", {"source": "python", "values": [None, False, "\u96ea"]})
+                mixed = await helper.command("mixed", pythonId=python.client_id)
+                assert len(mixed["results"]) == 8
+                routes = {route["request_id"]: route for route in mixed["acceptances"]}
+                assert len(routes) == 4
+                for _ in range(4):
+                    result = await blocking(hooks.get, timeout=5)
+                    route = routes.pop(result["request_id"])
+                    assert result["source_client_id"] == route["origin"] and result["target_client_id"] == route["target"]
+                    assert result["response_to"] == "python-main" and result["error"] is None
+                    assert result["value"] == {"owner": route["target"], "kind": route["kind"], "value": 13}
+                assert not routes
+                for client_id in ("node-main", "browser-main"):
+                    for kind in ("app", "process"):
+                        if kind == "app":
+                            result = await blocking(python.call_app, client_id, "calculate", timeout=5, a=2, b=3)
+                        else:
+                            result = await blocking(python.process.call, client_id + ":compute", _timeout=5, a=2, b=3)
+                        assert result == {"owner": client_id, "kind": kind, "value": 5}
+                        if kind == "app":
+                            accepted = await blocking(python.call_app, client_id, "calculate", response_to="node-peer",
+                                                      timeout=5, a=4, b=5)
+                        else:
+                            accepted = await blocking(python.process.call, client_id + ":compute", response_to="node-peer",
+                                                      _timeout=5, a=4, b=5)
+                        assert accepted["queued"] is True
+                        result = await helper.command("hook", recipient="node-peer", requestId=accepted["request_id"])
+                        assert result["request_id"] == result["payload"]["request_id"] == accepted["request_id"]
+                        assert result["pool"] == pool and result["payload"]["source_client_id"] == "python-main"
+                        assert result["payload"]["value"] == {"owner": client_id, "kind": kind, "value": 9}
+                await blocking(python.subscribe_buffer, "python-old-subscription")
+                await blocking(python.switch_pool, target_pool, "target-token", timeout=6)
+                assert python._socket.getpeername()[1] == cluster.children[1].port
+                assert python.client_id == "python-main" and python.pool_name == target_pool
+                assert python._port == cluster.tcp_port
+                assert not python._processes
+                for client_id in ("node-main", "browser-main"):
+                    switched = await helper.command("switch", clientId=client_id, pool=target_pool, authToken="target-token")
+                    assert switched["endpoints"][client_id]["pool"] == target_pool
+                    assert switched["endpoints"][client_id]["port"] == (
+                        cluster.children[1].ws_port if client_id == "browser-main" else cluster.children[1].port)
+                    assert switched["endpoints"][client_id]["configuredPort"] == cluster.tcp_port
+                old, _ = await cluster.join("old-observer", pool)
+                assert (await old.ack("list_clients"))["payload"]["clients"] == ["node-peer", "old-observer"]
+                assert set((await old.ack("list_processes"))["payload"]["processes"]) == {"node-peer:compute"}
+                assert (await target.ack("list_clients"))["payload"]["clients"] == [
+                    "browser-main", "node-main", "python-main", "target-peer"]
+                assert (await target.ack("list_processes"))["payload"]["processes"] == {}
+                assert (await helper.command("report"))["errors"] == []
+                stats = await cluster.refresh_stats()
+                assert stats[0]["pools"] == stats[1]["pools"] == 1
+                assert stats[2]["pools"] == stats[3]["pools"] == 0
+            finally:
+                if python is not None:
+                    await blocking(python.disconnect)

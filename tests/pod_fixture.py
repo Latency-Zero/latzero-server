@@ -206,6 +206,7 @@ class PodCluster:
             waiter = asyncio.get_running_loop().create_future()
             self.stats_waiters[child.index] = waiter
             child._stats_pending = True
+            child._stats_requested = asyncio.get_running_loop().time()
             try:
                 await self.supervisor._send_control(child, {"operation": "stats"})
                 result = await asyncio.wait_for(waiter, 5)
