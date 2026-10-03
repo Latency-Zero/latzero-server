@@ -181,6 +181,7 @@ async def test_restart_refuses_inflight_saver_before_replacing_owned_store(tmp_p
         assert server._pools["owned"].buffers["latest"].value == "old"
     finally:
         release.set()
+        await asyncio.wait_for(asyncio.shield(saver._saver_task), 3)
         saver._shutdown_timeout = 3
         await server.stop()
     assert server._directory_lock is None
