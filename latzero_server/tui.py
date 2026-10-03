@@ -72,8 +72,9 @@ def _build_logo_art(
 
     # Resize to (target_cols, target_rows * 2) preserving aspect ratio
     target_h = target_rows * 2
-    img.thumbnail((target_cols, target_h), Image.LANCZOS)
-    img = img.resize((target_cols, target_h), Image.LANCZOS)
+    resampling = getattr(Image, "Resampling", Image).LANCZOS
+    img.thumbnail((target_cols, target_h), resampling)
+    img = img.resize((target_cols, target_h), resampling)
 
     pixels = img.load()
     w, h = img.size

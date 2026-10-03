@@ -1,0 +1,3 @@
+include lat.png logo.png
+recursive-include examples *.py
+recursive-include tests *.py *.cjs

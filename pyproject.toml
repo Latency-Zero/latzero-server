@@ -15,10 +15,13 @@ authors = [
 dependencies = ["websockets>=12.0"]
 
 [project.optional-dependencies]
-tui = ["Pillow>=9.0"]
+tui = ["Pillow>=9.0", "prompt_toolkit>=3.0"]
 
 [project.scripts]
 latzero-server = "latzero_server.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["latzero_server*"]
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"

@@ -3,7 +3,8 @@ Data models for latzero-server runtime state.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set
+from collections import deque
+from typing import Any, Deque, Dict, List, Optional, Set
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +72,8 @@ class BufferEntry:
     persistent: bool = False
     ttl: Optional[float] = None
     version: int = 1
+    expires_at: Optional[float] = None  # Monotonic runtime deadline, not persisted.
+    size_bytes: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -106,6 +109,16 @@ class RouteEntry:
     created_at: float
     expires_at: Optional[float] = None
     process_registration_id: Optional[str] = None  # for in_flight tracking on scalable processes
+    process_registration: Optional[ProcessRegistration] = None
+    origin_request_id: Optional[str] = None
+    parent_request_id: Optional[str] = None
+    origin_session: Optional["ClientSession"] = None
+    target_session: Optional["ClientSession"] = None
+    response_session: Optional["ClientSession"] = None
+    origin_generation: int = 0
+    target_generation: int = 0
+    response_generation: int = 0
+    sent: bool = False
 
 
 @dataclass
@@ -121,6 +134,8 @@ class PoolState:
     in_flight_requests: Dict[str, RouteEntry] = field(default_factory=dict)
     # Process pool: maps canonical "owner_client_id:process_name" → ProcessRegistration
     processes: Dict[str, "ProcessRegistration"] = field(default_factory=dict)
+    buffer_bytes: int = 0
+    subscription_count: int = 0
 
     def snapshot(self) -> dict:
         return {
@@ -135,11 +150,27 @@ class PoolState:
         }
 
 
-@dataclass
+@dataclass(eq=False)
 class ClientSession:
     """Connection-scoped client session."""
 
     client_id: str
     writer: Any
     pool_id: Optional[str] = None
+    closed: bool = False
+    closing: bool = False
+    generation: int = 0
+    active_requests: Set[str] = field(default_factory=set)
+    active_request_counts: Dict[str, int] = field(default_factory=dict)
+    route_count: int = 0
+    outbox: Deque[Any] = field(default_factory=deque)
+    outbox_bytes: int = 0
+    outbox_messages: int = 0
+    outbox_ready: Any = None
+    outbox_drained: Any = None
+    writer_task: Any = None
+    reader_task: Any = None
+    joined: Any = None
+    joined_once: bool = False
+    close_task: Any = None
 

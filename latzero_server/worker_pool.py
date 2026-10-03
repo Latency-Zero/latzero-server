@@ -1,15 +1,10 @@
 """
 Auto-scaling asyncio worker pool for LatZero message dispatch.
 
-Architecture:
-    [Reader 1] ──┐
-    [Reader 2] ──┤    ┌───────────────────┐    ┌──────────────────┐
-    [Reader N] ──┼──→ │  Dispatch Queue   │ ──→│  Worker Pool     │
-                 └──── │  (asyncio.Queue)  │    │  4–1280 Tasks     │
-                       └───────────────────┘    └──────────────────┘
-                                                        ↑
-                                               Auto-Scaling Controller
-                                               (proportional + predictive)
+Readers admit messages without yielding into bounded per-session FIFOs.
+A ready-session FIFO assigns one worker per session, with bounded dispatch
+slices so hot sessions cannot monopolize the event loop. Pending budgets
+include the message currently being dispatched.
 
 Scaling algorithm
 -----------------
@@ -29,11 +24,16 @@ Scale-down: queue < scale_down_threshold sustained for scale_down_hold
 """
 
 import asyncio
+import json
+import logging
+import math
 import time
-from contextlib import suppress
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
-from typing import Any, Callable, Coroutine, Deque, List, Optional, Tuple
-from collections import deque
+from typing import Any, Callable, Coroutine, Deque, Dict, List, Optional, Tuple
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +63,16 @@ class WorkerPoolStats:
     predicted_depth: float = 0.0
     prediction_confidence: float = 0.0   # 0.0–1.0
     low_depth_since: Optional[float] = None
+    queue_bytes: int = 0
+    active_dispatches: int = 0
+    pending_retirements: int = 0
+    rejected_messages: int = 0
+    discarded_messages: int = 0
+    dispatch_failures: int = 0
+    queue_wait_seconds: float = 0.0       # cumulative, for dispatched messages
+    service_seconds: float = 0.0          # cumulative, including failed dispatches
+    max_queue_wait_seconds: float = 0.0
+    max_service_seconds: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -143,17 +153,31 @@ class LoadPredictor:
 # Worker Pool
 # ---------------------------------------------------------------------------
 
-# Sentinel pushed onto the queue to signal a worker to exit cleanly
-_STOP_SENTINEL = object()
+@dataclass
+class _QueuedMessage:
+    message: dict
+    byte_size: int
+    generation: int
+    submitted_at: float
+
+
+@dataclass
+class _SessionMailbox:
+    session: Any
+    messages: Deque[_QueuedMessage] = field(default_factory=deque)
+    pending_messages: int = 0
+    pending_bytes: int = 0
+    active: bool = False
 
 
 class AutoScalingWorkerPool:
     """
-    Shared asyncio.Queue fed by reader coroutines and drained by a
-    self-scaling pool of worker Tasks.
+    Bounded per-session FIFOs drained by a self-scaling pool of worker Tasks.
 
     Workers are ephemeral asyncio Tasks — zero process spawn overhead.
-    Readers are never blocked by dispatch; they enqueue and move on.
+    Readers never wait for queue capacity: submission accepts or rejects
+    synchronously. Only app_result messages can use the additive control
+    reserve, without bypassing their session's FIFO.
 
     Scaling layers (applied every controller_interval seconds):
       1. Emergency burst  — depth > 5 × threshold → add burst_size workers
@@ -177,7 +201,58 @@ class AutoScalingWorkerPool:
         # Workers to add in one shot when depth > emergency_multiplier × threshold
         burst_size: int = 64,
         emergency_multiplier: float = 5.0,
+        max_session_messages: int = 256,
+        max_session_bytes: int = 1024 * 1024,
+        max_queue_messages: int = 8192,
+        max_queue_bytes: int = 32 * 1024 * 1024,
+        control_reserve_messages: int = 32,
+        control_reserve_bytes: int = 64 * 1024,
+        dispatch_slice: int = 16,
+        dispatch_slice_seconds: float = 0.002,
+        shutdown_timeout: float = 5.0,
+        max_sessions: int = 5000,
     ):
+        for name, value in (
+            ("min_workers", min_workers),
+            ("max_workers", max_workers),
+            ("scale_up_threshold", scale_up_threshold),
+            ("scale_down_threshold", scale_down_threshold),
+            ("max_step_up", max_step_up),
+            ("burst_size", burst_size),
+            ("max_session_messages", max_session_messages),
+            ("max_session_bytes", max_session_bytes),
+            ("max_queue_messages", max_queue_messages),
+            ("max_queue_bytes", max_queue_bytes),
+            ("dispatch_slice", dispatch_slice),
+            ("max_sessions", max_sessions),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if min_workers > max_workers:
+            raise ValueError("min_workers must not exceed max_workers")
+        for name, value in (
+            ("control_reserve_messages", control_reserve_messages),
+            ("control_reserve_bytes", control_reserve_bytes),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+        for name, value, allow_zero in (
+            ("controller_interval", controller_interval, False),
+            ("emergency_multiplier", emergency_multiplier, False),
+            ("dispatch_slice_seconds", dispatch_slice_seconds, False),
+            ("scale_down_hold", scale_down_hold, True),
+            ("shutdown_timeout", shutdown_timeout, True),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+                or (value == 0 and not allow_zero)
+            ):
+                qualifier = "nonnegative" if allow_zero else "positive"
+                raise ValueError(f"{name} must be finite and {qualifier}")
+
         self._dispatch_fn = dispatch_fn
         self._min_workers = min_workers
         self._max_workers = max_workers
@@ -188,9 +263,31 @@ class AutoScalingWorkerPool:
         self._max_step_up = max_step_up
         self._burst_size = burst_size
         self._emergency_multiplier = emergency_multiplier
+        self._max_session_messages = max_session_messages
+        self._max_session_bytes = max_session_bytes
+        self._max_queue_messages = max_queue_messages
+        self._max_queue_bytes = max_queue_bytes
+        self._control_reserve_messages = control_reserve_messages
+        self._control_reserve_bytes = control_reserve_bytes
+        self._dispatch_slice = dispatch_slice
+        self._dispatch_slice_seconds = dispatch_slice_seconds
+        self._shutdown_timeout = shutdown_timeout
+        self._max_sessions = max_sessions
 
-        # The shared message queue (unbounded — readers never block)
-        self._queue: asyncio.Queue[Any] = asyncio.Queue()
+        self._mailboxes: Dict[int, _SessionMailbox] = {}
+        # Ordered keys allow FIFO scheduling and O(1) removal on disconnect,
+        # without accumulating stale ready tokens or idle session references.
+        self._ready = OrderedDict()
+        # Python 3.8 synchronization primitives bind when created. Allocate
+        # them in start(), not in a constructor used outside asyncio.run().
+        self._work_available = None
+        self._drained = None
+        self._pending_messages = 0
+        self._pending_bytes = 0
+        self._pending_retirements = 0
+        self._running = False
+        self._aborting = True
+        self._stop_task: Optional[asyncio.Task] = None
 
         # Active worker tasks
         self._workers: List[asyncio.Task] = []
@@ -214,6 +311,25 @@ class AutoScalingWorkerPool:
 
     async def start(self) -> None:
         """Start the minimum number of workers and the scaling controller."""
+        if self._stop_task is not None:
+            stopping = self._stop_task
+            await asyncio.shield(stopping)
+            if self._stop_task is stopping:
+                self._stop_task = None
+        if self._running:
+            return
+        self._workers[:] = [task for task in self._workers if not task.done()]
+        if self._workers:
+            raise RuntimeError("Previous dispatch workers have not stopped")
+        self._work_available = asyncio.Event()
+        self._drained = asyncio.Event()
+        self._drained.set()
+        self._running = True
+        self._aborting = False
+        self._pending_retirements = 0
+        self._stats.low_depth_since = None
+        self._msg_counter = 0
+        self._last_tps_tick = time.monotonic()
         for _ in range(self._min_workers):
             self._spawn_worker()
         self._controller_task = asyncio.create_task(
@@ -222,32 +338,182 @@ class AutoScalingWorkerPool:
         self._update_stats()
 
     async def stop(self) -> None:
-        """
-        Gracefully shut down: cancel controller, then signal each worker
-        with the stop sentinel and wait for all to finish.
-        """
+        """Seal admission, drain to a deadline, then cancel remaining workers."""
+        if self._stop_task is None:
+            self._running = False
+            self._pending_retirements = 0
+            self._stop_task = asyncio.create_task(
+                self._shutdown(), name="latzero-worker-shutdown"
+            )
+        stopping = self._stop_task
+        try:
+            await asyncio.shield(stopping)
+        finally:
+            if stopping.done() and self._stop_task is stopping:
+                self._stop_task = None
+
+    async def _shutdown(self) -> None:
+        deadline = time.monotonic() + self._shutdown_timeout
         if self._controller_task is not None:
             self._controller_task.cancel()
-            with suppress(asyncio.CancelledError):
+            try:
                 await self._controller_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Worker scaling controller failed during shutdown")
             self._controller_task = None
 
-        # Send one sentinel per live worker so each exits after its current msg
-        for _ in self._workers:
-            await self._queue.put(_STOP_SENTINEL)
+        if self._pending_messages:
+            try:
+                await asyncio.wait_for(
+                    self.join(), timeout=max(0.0, deadline - time.monotonic())
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Worker shutdown timed out with %d pending messages",
+                    self._pending_messages,
+                )
 
+        self._aborting = True
+        for mailbox in list(self._mailboxes.values()):
+            self.invalidate(mailbox.session)
+        workers = [task for task in self._workers if not task.done()]
+        for task in workers:
+            task.cancel()
+        if workers:
+            # asyncio.wait, unlike wait_for(gather(...)), remains bounded even
+            # when an application handler suppresses cancellation.
+            await asyncio.wait(
+                workers, timeout=max(0.0, deadline - time.monotonic())
+            )
+        if self._work_available is not None:
+            self._work_available.clear()
+        self._workers[:] = [task for task in self._workers if not task.done()]
         if self._workers:
-            with suppress(Exception):
-                await asyncio.gather(*self._workers, return_exceptions=True)
-        self._workers.clear()
+            logger.error(
+                "%d dispatch workers still running after cancellation; restart requires their exit",
+                len(self._workers),
+            )
+        self._update_stats()
+
+    async def join(self) -> None:
+        """Wait until all admitted messages have finished or been discarded."""
+        while self._pending_messages:
+            await self._drained.wait()
 
     # ------------------------------------------------------------------
     # Message submission (called by reader coroutines)
     # ------------------------------------------------------------------
 
-    async def submit(self, session: Any, message: dict) -> None:
-        """Enqueue a (session, message) pair for dispatch. Non-blocking."""
-        await self._queue.put((session, message))
+    async def submit(
+        self, session: Any, message: dict, byte_size: Optional[int] = None
+    ) -> bool:
+        """Admit without yielding; False means no message was enqueued.
+
+        byte_size is the ingress frame's byte length. When omitted, compact
+        UTF-8 JSON length is estimated without retaining an encoded copy.
+        Budgets cover queued and active messages, not decoded-object overhead.
+        """
+        if (
+            not self._running
+            or getattr(session, "closed", False)
+            or getattr(session, "closing", False)
+            or not isinstance(message, dict)
+        ):
+            return self._reject_submission()
+
+        key = id(session)
+        mailbox = self._mailboxes.get(key)
+        if mailbox is None and len(self._mailboxes) >= self._max_sessions:
+            return self._reject_submission()
+        control = message.get("type") == "app_result"
+        reserve_messages = self._control_reserve_messages if control else 0
+        reserve_bytes = self._control_reserve_bytes if control else 0
+        session_messages = mailbox.pending_messages if mailbox is not None else 0
+        session_bytes = mailbox.pending_bytes if mailbox is not None else 0
+        if (
+            session_messages + 1 > self._max_session_messages + reserve_messages
+            or self._pending_messages + 1 > self._max_queue_messages + reserve_messages
+        ):
+            return self._reject_submission()
+        available_bytes = min(
+            self._max_session_bytes + reserve_bytes - session_bytes,
+            self._max_queue_bytes + reserve_bytes - self._pending_bytes,
+        )
+        if byte_size is None:
+            byte_size = 0
+            try:
+                encoder = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"))
+                for chunk in encoder.iterencode(message):
+                    byte_size += len(chunk.encode("utf-8"))
+                    if byte_size > available_bytes:
+                        return self._reject_submission()
+            except (TypeError, ValueError, UnicodeError, RecursionError):
+                return self._reject_submission()
+        if (
+            isinstance(byte_size, bool)
+            or not isinstance(byte_size, int)
+            or byte_size < 0
+            or byte_size > available_bytes
+        ):
+            return self._reject_submission()
+
+        if mailbox is None:
+            mailbox = _SessionMailbox(session=session)
+            self._mailboxes[key] = mailbox
+        mailbox.messages.append(
+            _QueuedMessage(
+                message=message,
+                byte_size=byte_size,
+                generation=getattr(session, "generation", 0),
+                submitted_at=time.monotonic(),
+            )
+        )
+        mailbox.pending_messages += 1
+        mailbox.pending_bytes += byte_size
+        self._pending_messages += 1
+        self._pending_bytes += byte_size
+        self._drained.clear()
+        if not mailbox.active:
+            self._ready[key] = None
+            self._work_available.set()
+        return True
+
+    def _reject_submission(self) -> bool:
+        self._stats.rejected_messages += 1
+        return False
+
+    def invalidate(self, session: Any) -> None:
+        """Purge queued work on disconnect; an active handler finishes separately.
+
+        Mark the session closed/closing before calling this. Pool membership
+        transitions must not invalidate following pipelined messages.
+        """
+        key = id(session)
+        mailbox = self._mailboxes.get(key)
+        if mailbox is None or mailbox.session is not session:
+            return
+        while mailbox.messages:
+            self._complete_message(mailbox, mailbox.messages.popleft(), discarded=True)
+        self._ready.pop(key, None)
+        if not mailbox.active:
+            self._mailboxes.pop(key, None)
+        if not self._ready and not self._pending_retirements:
+            if self._work_available is not None:
+                self._work_available.clear()
+
+    def _complete_message(
+        self, mailbox: _SessionMailbox, item: _QueuedMessage, discarded: bool = False
+    ) -> None:
+        mailbox.pending_messages -= 1
+        mailbox.pending_bytes -= item.byte_size
+        self._pending_messages -= 1
+        self._pending_bytes -= item.byte_size
+        if discarded:
+            self._stats.discarded_messages += 1
+        if not self._pending_messages:
+            self._drained.set()
 
     # ------------------------------------------------------------------
     # Worker
@@ -256,28 +522,107 @@ class AutoScalingWorkerPool:
     def _spawn_worker(self) -> asyncio.Task:
         task = asyncio.create_task(self._worker_loop(), name="latzero-worker")
         self._workers.append(task)
-        # Remove from list when done (normal exit or exception)
-        task.add_done_callback(lambda t: self._workers.remove(t) if t in self._workers else None)
+        task.add_done_callback(self._worker_done)
         return task
 
+    def _worker_done(self, task: asyncio.Task) -> None:
+        if task in self._workers:
+            self._workers.remove(task)
+        if not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                logger.error(
+                    "Dispatch worker exited unexpectedly",
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+        live = self._worker_count()
+        self._pending_retirements = min(
+            self._pending_retirements, max(0, live - self._min_workers)
+        )
+        if self._running:
+            for _ in range(max(0, self._min_workers - live)):
+                self._spawn_worker()
+
+    def _worker_count(self) -> int:
+        return sum(not task.done() for task in self._workers)
+
     async def _worker_loop(self) -> None:
-        """Pull messages from the queue and dispatch them."""
-        while True:
-            item = await self._queue.get()
+        """Claim a ready session, dispatch one bounded slice, then yield."""
+        while not self._aborting:
+            if self._pending_retirements:
+                if self._worker_count() > self._min_workers:
+                    self._pending_retirements -= 1
+                    # Remove synchronously with claiming retirement, rather
+                    # than leaving an exiting worker available to retire twice.
+                    self._workers.remove(asyncio.current_task())
+                    return
+                self._pending_retirements = 0
+            if not self._ready:
+                self._work_available.clear()
+                await self._work_available.wait()
+                continue
+
+            key, _ = self._ready.popitem(last=False)
+            mailbox = self._mailboxes[key]
+            mailbox.active = True
+            slice_started = time.monotonic()
+            processed = 0
             try:
-                if item is _STOP_SENTINEL:
-                    return  # Clean exit
-                session, message = item
-                self._msg_counter += 1
-                self._stats.messages_processed += 1
-                try:
-                    await self._dispatch_fn(session, message)
-                except Exception:
-                    # Errors are handled inside _dispatch_fn; swallow here
-                    # so a buggy handler never kills the worker.
-                    pass
+                while mailbox.messages:
+                    session = mailbox.session
+                    if getattr(session, "closed", False) or getattr(session, "closing", False):
+                        self.invalidate(session)
+                        break
+                    item = mailbox.messages.popleft()
+                    # A FIFO join/switch may advance generation. Do not drop
+                    # later pipelined frames solely for that change: dispatch_fn
+                    # must validate any explicit pool against current membership.
+                    started = time.monotonic()
+                    wait = started - item.submitted_at
+                    self._stats.queue_wait_seconds += wait
+                    self._stats.max_queue_wait_seconds = max(
+                        self._stats.max_queue_wait_seconds, wait
+                    )
+                    self._msg_counter += 1
+                    self._stats.messages_processed += 1
+                    self._stats.active_dispatches += 1
+                    cancelled = False
+                    try:
+                        await self._dispatch_fn(session, item.message)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                        raise
+                    except Exception:
+                        self._stats.dispatch_failures += 1
+                        logger.exception(
+                            "Message dispatch failed for session %s (type=%r)",
+                            key,
+                            item.message.get("type"),
+                        )
+                    finally:
+                        service = time.monotonic() - started
+                        self._stats.service_seconds += service
+                        self._stats.max_service_seconds = max(
+                            self._stats.max_service_seconds, service
+                        )
+                        self._stats.active_dispatches -= 1
+                        self._complete_message(mailbox, item, discarded=cancelled)
+                    processed += 1
+                    if (
+                        processed >= self._dispatch_slice
+                        or time.monotonic() - slice_started >= self._dispatch_slice_seconds
+                    ):
+                        break
             finally:
-                self._queue.task_done()
+                mailbox.active = False
+                if mailbox.messages:
+                    self._ready[key] = None
+                    self._work_available.set()
+                else:
+                    self._mailboxes.pop(key, None)
+                # Idle worker frames must not retain finished sessions/payloads.
+                mailbox = session = item = None
+            await asyncio.sleep(0)
 
     # ------------------------------------------------------------------
     # Auto-scaling controller  (runs every controller_interval seconds)
@@ -289,13 +634,13 @@ class AutoScalingWorkerPool:
             await asyncio.sleep(self._controller_interval)
             self._update_stats()
 
-            depth = self._queue.qsize()
+            depth = self._pending_messages
             self._predictor.record(float(depth))
             predicted, confidence = self._predictor.predict()
             self._stats.predicted_depth = predicted
             self._stats.prediction_confidence = confidence
 
-            n = len(self._workers)
+            n = self._worker_count() - self._pending_retirements
 
             # ── Layer 1: Emergency burst ─────────────────────────────────
             # Queue is critically deep (> N× threshold). Spawn a large batch
@@ -372,11 +717,16 @@ class AutoScalingWorkerPool:
     # ------------------------------------------------------------------
 
     def _scale_up(self, count: int, reason: str) -> None:
-        old = len(self._workers)
-        to_add = min(count, self._max_workers - old)
+        if not self._running:
+            return
+        live = self._worker_count()
+        old = live - self._pending_retirements
+        restored = min(max(0, count), self._pending_retirements)
+        self._pending_retirements -= restored
+        to_add = min(max(0, count - restored), self._max_workers - live)
         for _ in range(to_add):
             self._spawn_worker()
-        new = len(self._workers)
+        new = self._worker_count() - self._pending_retirements
         if new > old:
             ev = ScaleEvent(
                 timestamp=time.time(),
@@ -389,13 +739,14 @@ class AutoScalingWorkerPool:
             self._stats.scale_events = list(self._scale_events)
 
     def _scale_down(self, count: int, reason: str) -> None:
-        old = len(self._workers)
-        to_remove = min(count, old - self._min_workers)
+        if not self._running:
+            return
+        old = self._worker_count() - self._pending_retirements
+        to_remove = min(max(0, count), old - self._min_workers)
         if to_remove <= 0:
             return
-        # Put sentinels — the next idle worker(s) will pick them up and exit
-        for _ in range(to_remove):
-            self._queue.put_nowait(_STOP_SENTINEL)
+        self._pending_retirements += to_remove
+        self._work_available.set()
         new_expected = old - to_remove
         ev = ScaleEvent(
             timestamp=time.time(),
@@ -419,13 +770,17 @@ class AutoScalingWorkerPool:
             self._msg_counter = 0
             self._last_tps_tick = now
 
-        self._stats.active_workers = len(self._workers)
-        self._stats.queue_depth = self._queue.qsize()
+        self._stats.active_workers = self._worker_count()
+        self._stats.queue_depth = self._pending_messages
+        self._stats.queue_bytes = self._pending_bytes
+        self._stats.pending_retirements = self._pending_retirements
         self._stats.scale_events = list(self._scale_events)
 
     @property
     def stats(self) -> WorkerPoolStats:
         """Return a current stats snapshot (updates lazily on controller tick)."""
-        self._stats.active_workers = len(self._workers)
-        self._stats.queue_depth = self._queue.qsize()
+        self._stats.active_workers = self._worker_count()
+        self._stats.queue_depth = self._pending_messages
+        self._stats.queue_bytes = self._pending_bytes
+        self._stats.pending_retirements = self._pending_retirements
         return self._stats

@@ -1,37 +1,35 @@
-"""
-Protocol helpers for newline-delimited JSON messages.
+"""Shared TCP/WS JSON validation with stable stdlib numeric semantics."""
 
-Uses orjson when available (3-5x faster than stdlib json) with automatic
-fallback to the standard library.  Both encode and decode are intentionally
-kept as thin wrappers so the rest of the codebase never imports json directly.
-"""
+import json
+import math
+from typing import Any, Dict, Union
 
-from typing import Any, Dict
 
-try:
-    import orjson as _json_lib  # type: ignore[import]
+def validate_message(data: Any) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        raise ValueError("Protocol message must decode to an object")
+    if not isinstance(data.get("type"), str) or not data["type"]:
+        raise ValueError("Message type must be a nonempty string")
+    if data.get("payload") is not None and not isinstance(data["payload"], dict):
+        raise ValueError("Message payload must be an object or null")
+    for field in ("request_id", "client_id", "pool"):
+        if data.get(field) is not None and not isinstance(data[field], str):
+            raise ValueError(f"{field} must be a string or null")
+    stack = [data]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            stack.extend(value.values())
+        elif isinstance(value, list):
+            stack.extend(value)
+        elif isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("JSON numbers must be finite")
+    return data
 
-    def encode_message(message: Dict[str, Any]) -> bytes:
-        """Encode a message as newline-delimited JSON (orjson fast path)."""
-        return _json_lib.dumps(message) + b"\n"
 
-    def decode_message(raw: bytes) -> Dict[str, Any]:
-        """Decode one JSON line into a message dictionary (orjson fast path)."""
-        data = _json_lib.loads(raw)
-        if not isinstance(data, dict):
-            raise ValueError("Protocol message must decode to an object")
-        return data
+def encode_message(message: Dict[str, Any]) -> bytes:
+    return (json.dumps(message, separators=(",", ":"), ensure_ascii=True, allow_nan=False) + "\n").encode("utf-8")
 
-except ImportError:
-    import json as _stdlib_json
 
-    def encode_message(message: Dict[str, Any]) -> bytes:  # type: ignore[misc]
-        """Encode a message as newline-delimited JSON (stdlib fallback)."""
-        return (_stdlib_json.dumps(message, separators=(",", ":"), ensure_ascii=True) + "\n").encode("utf-8")
-
-    def decode_message(raw: bytes) -> Dict[str, Any]:  # type: ignore[misc]
-        """Decode one JSON line into a message dictionary (stdlib fallback)."""
-        data = _stdlib_json.loads(raw.decode("utf-8"))
-        if not isinstance(data, dict):
-            raise ValueError("Protocol message must decode to an object")
-        return data
+def decode_message(raw: Union[bytes, str]) -> Dict[str, Any]:
+    return validate_message(json.loads(raw))
