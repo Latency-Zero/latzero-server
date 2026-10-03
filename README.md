@@ -2,7 +2,7 @@
 
 **Let your local apps share state and call each other without each one becoming a server.**
 
-![LatZero](latzero-server/logo.png)
+![LatZero](./logo.png)
 
 ![Transport: TCP and WebSocket](https://img.shields.io/badge/transport-TCP%20%2B%20WebSocket-30363d)
 ![Protocol: JSON](https://img.shields.io/badge/protocol-JSON-30363d)
