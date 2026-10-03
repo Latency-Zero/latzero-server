@@ -415,7 +415,7 @@ class LatZeroServer:
         self._fanout_bytes = 0
         try:
             if self._storage_started:
-                if (self._storage_stop_attempted and self._store.health["dirty_pools"]
+                if (self._storage_stop_attempted
                         and not self._store.health["running"] and not self._store.health["in_flight"]):
                     self._store.start()
                 self._storage_stop_attempted = True
