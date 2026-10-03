@@ -105,7 +105,7 @@ async def test_preconstructed_daemon_recaptures_snapshot_under_owner_lock(tmp_pa
     server = LatZeroServer(ServerConfig(port=0, websocket_enabled=False, data_dir=tmp_path))
     pool = PoolState(pool_id="new")
     pool.buffers["saved"] = BufferEntry(value=42, updated_at=1, updated_by="old", persistent=True)
-    SnapshotStore(tmp_path).save_pool(pool)
+    await asyncio.get_running_loop().run_in_executor(None, SnapshotStore(tmp_path).save_pool, pool)
     assert "new" not in server._pools
     await server.start()
     try:
