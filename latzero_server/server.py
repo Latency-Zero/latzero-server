@@ -93,6 +93,7 @@ class LatZeroServer:
         self.config.validate()
         self._pool_routing = pool_routing
         self._directory_lock = None
+        self._directory_owner_token = None
         self._storage_started = False
         self._initial_storage_loaded = pool_routing is not None
         self._storage_stop_attempted = False
@@ -255,7 +256,10 @@ class LatZeroServer:
                 # Constructor inspection is read-only state. Re-capture under
                 # ownership before opening listeners so a preconstructed daemon
                 # cannot start from snapshots changed by a previous owner.
-                if not self._initial_storage_loaded:
+                ownership_changed = (self._directory_owner_token is not None
+                                     and self._directory_lock.previous_owner_token != self._directory_owner_token)
+                self._directory_owner_token = self._directory_lock.owner_token
+                if not self._initial_storage_loaded or ownership_changed:
                     self._pools.clear()
                     self._expiry_heap.clear()
                     self._store = SnapshotStore(self.config.data_dir,
