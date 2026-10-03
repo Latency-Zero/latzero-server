@@ -256,6 +256,135 @@ async def test_stop_escalation_handles_actual_runtime_not_only_venv_launcher(tmp
 
 
 @pytest.mark.asyncio
+async def test_pre_ready_control_failure_discovers_and_reaps_runtime(tmp_path, monkeypatch):
+    import latzero_server.pods as module
+
+    monkeypatch.setattr(module, "_STOP_GRACE", 0.1)
+    monkeypatch.setattr(module, "_REAP_TIMEOUT", 1.0)
+    real_spawn = asyncio.create_subprocess_exec
+    discovered = []
+    real_discover = module._PodProcess.discover_runtimes
+
+    async def spawn(*args, **options):
+        return await real_spawn(sys.executable, str(Path(__file__).resolve()), "--pre-ready-child", **options)
+
+    def discover(process):
+        real_discover(process)
+        if process.runtime is not None:
+            discovered.append((process.launcher.pid, process.runtime))
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(module._PodProcess, "discover_runtimes", discover)
+    supervisor = PodSupervisor(_config(tmp_path, websocket_enabled=False), 2)
+    with pytest.raises(RuntimeError, match="Unexpected pod control output"):
+        await asyncio.wait_for(supervisor.start(), 5)
+    assert all(child.process is None or child.process.returncode is not None for child in supervisor.children)
+    assert supervisor._directory_lock is None
+    if os.name == "nt":
+        assert discovered
+        assert all(launcher != handle.pid for launcher, handle in discovered)
+        assert all(handle.handle is None or not handle.alive() for _, handle in discovered)
+    with DataDirectoryLock(tmp_path):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_public_ports_stay_inactive_until_every_child_configured(tmp_path, monkeypatch):
+    supervisor = PodSupervisor(_config(tmp_path, websocket_enabled=False), 2)
+    configuring = asyncio.Event()
+    release = asyncio.Event()
+    original = supervisor._send_control
+
+    async def send_control(child, message, deadline=None):
+        if message.get("operation") == "configure" and child.index == 1:
+            configuring.set()
+            await release.wait()
+        await original(child, message, deadline)
+
+    monkeypatch.setattr(supervisor, "_send_control", send_control)
+    starting = asyncio.create_task(supervisor.start())
+    try:
+        await asyncio.wait_for(configuring.wait(), 5)
+        assert not supervisor._accepting
+        assert not supervisor._tcp_server.is_serving()
+        assert all(child.port for child in supervisor.children)
+        with pytest.raises((ConnectionRefusedError, OSError)):
+            await asyncio.wait_for(asyncio.open_connection("127.0.0.1", supervisor.tcp_port), 2)
+        release.set()
+        await asyncio.wait_for(starting, 5)
+        assert supervisor._accepting and supervisor._tcp_server.is_serving()
+    finally:
+        release.set()
+        if not starting.done():
+            starting.cancel()
+        await asyncio.gather(starting, return_exceptions=True)
+        await supervisor.stop()
+
+
+@pytest.mark.asyncio
+async def test_start_cancellation_reaps_partial_children_before_root_release(tmp_path, monkeypatch):
+    supervisor = PodSupervisor(_config(tmp_path, websocket_enabled=False), 2)
+    configuring = asyncio.Event()
+    original = supervisor._send_control
+
+    async def send_control(child, message, deadline=None):
+        if message.get("operation") == "configure":
+            configuring.set()
+            await asyncio.Future()
+        await original(child, message, deadline)
+
+    monkeypatch.setattr(supervisor, "_send_control", send_control)
+    starting = asyncio.create_task(supervisor.start())
+    await asyncio.wait_for(configuring.wait(), 5)
+    with pytest.raises(DataDirectoryLockError):
+        DataDirectoryLock(tmp_path).acquire()
+    starting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(starting, 5)
+    assert not supervisor._accepting
+    assert supervisor._directory_lock is None
+    assert all(child.process.returncode == 0 for child in supervisor.children)
+    assert not supervisor._spawns and not supervisor._creations
+    with DataDirectoryLock(tmp_path):
+        pass
+    monkeypatch.setattr(supervisor, "_send_control", original)
+    try:
+        await supervisor.start()
+    finally:
+        await supervisor.stop()
+
+
+@pytest.mark.asyncio
+async def test_failed_partial_spawn_cannot_leave_sibling_spawn_after_cleanup(tmp_path, monkeypatch):
+    supervisor = PodSupervisor(_config(tmp_path, websocket_enabled=False), 2)
+    ready = asyncio.Event()
+    original = supervisor._spawn
+    cancelled = asyncio.Event()
+
+    async def spawn(child, config, deadline):
+        if child.index == 0:
+            try:
+                await original(child, config, deadline)
+                ready.set()
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+        else:
+            await ready.wait()
+            raise OSError("injected spawn failure")
+
+    monkeypatch.setattr(supervisor, "_spawn", spawn)
+    with pytest.raises(OSError, match="injected spawn failure"):
+        await asyncio.wait_for(supervisor.start(), 5)
+    assert cancelled.is_set()
+    assert not supervisor._spawns and not supervisor._creations
+    assert supervisor._directory_lock is None
+    assert all(child.process is None or child.process.returncode is not None for child in supervisor.children)
+    with DataDirectoryLock(tmp_path):
+        pass
+
+
+@pytest.mark.asyncio
 async def test_parent_crash_child_slot_blocks_new_root_until_flush_exits(tmp_path):
     process = await asyncio.create_subprocess_exec(sys.executable, str(Path(__file__).resolve()), "--orphan-parent", str(tmp_path),
                                                    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
@@ -458,3 +587,7 @@ elif __name__ == "__main__" and sys.argv[1] == "--draining-pod":
                 resources["lock"].release()
 
     raise SystemExit(asyncio.run(draining_child()))
+elif __name__ == "__main__" and sys.argv[1] == "--pre-ready-child":
+    sys.stdin.buffer.readline()
+    print(json.dumps({"waiting": True, "pid": os.getpid()}), flush=True)
+    asyncio.run(asyncio.Event().wait())

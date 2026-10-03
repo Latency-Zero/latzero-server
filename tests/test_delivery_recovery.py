@@ -35,6 +35,42 @@ async def test_immediate_connection_failure_cancels_untransmitted_call(tmp_path,
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("closed_peer", ["origin", "response"])
+async def test_underlying_transport_close_cancels_route_before_invocation(tmp_path, closed_peer):
+    async with server_with_limits(tmp_path, write_timeout=0.1) as (server, _):
+        pool = PoolState(pool_id="transport-fence")
+        server._pools[pool.pool_id] = pool
+        origin, origin_writer = controlled_session(server, pool, "origin")
+        target, target_writer = controlled_session(server, pool, "target")
+        response, response_writer = controlled_session(server, pool, "response")
+        route = server._accept_call(pool, origin, target, "echo", {"response_to": "response"}, {"request_id": "unsent"})
+        {"origin": origin_writer, "response": response_writer}[closed_peer].close()
+        assert not {"origin": origin, "response": response}[closed_peer].closing
+        await drain_outboxes(server)
+        assert not any(frame["type"] == "call_app" for frame in target_writer.frames)
+        assert not route.sent and not pool.in_flight_requests
+        errors = [frame for frame in origin_writer.frames + response_writer.frames if frame["type"] == "error"]
+        assert errors and all(frame["payload"]["execution_uncertain"] is False for frame in errors)
+
+
+@pytest.mark.asyncio
+async def test_closed_transport_does_not_dispatch_buffered_membership_or_mutation(tmp_path):
+    async with server_with_limits(tmp_path) as (server, _):
+        pool = PoolState(pool_id="owned")
+        server._pools[pool.pool_id] = pool
+        joined, writer = controlled_session(server, pool, "joined")
+        writer.close()
+        await server._dispatch(joined, {"type": "set_buffer", "payload": {"key": "not-written", "value": 42}})
+        assert not pool.buffers
+        pending, pending_writer = controlled_session(server, pool, "pending")
+        pool.clients.pop("pending")
+        pending.pool_id = None
+        pending_writer.close()
+        await server._dispatch(pending, {"type": "join_pool", "payload": {"client_id": "pending", "pool": "new"}})
+        assert "new" not in server._pools
+
+
+@pytest.mark.asyncio
 async def test_oversized_acceptance_ack_rejects_origin_before_target_admission(tmp_path):
     async with server_with_limits(tmp_path, max_frame_bytes=1024) as (server, connect):
         origin = await connect()

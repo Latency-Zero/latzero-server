@@ -307,7 +307,7 @@ class _PodProcess:
             descendants.update(found)
         descendants.discard(self.launcher.pid)
         for pid in descendants:
-            if self.runtime is not None and pid == self.runtime.pid or pid in self._extra_runtimes:
+            if (self.runtime is not None and pid == self.runtime.pid) or pid in self._extra_runtimes:
                 continue
             try:
                 handle = _WindowsProcess(pid, terminate=True)
@@ -944,11 +944,13 @@ class PodSupervisor:
 
     async def _stop_router(self, deadline: float) -> None:
         errors = []
+        loop = asyncio.get_running_loop()
         for reader in list(self._readers):
             reader.cancel()
         closers = [asyncio.create_task(self._close_session(session)) for session in list(self._sessions.values())]
         if closers:
-            done, pending = await asyncio.wait(closers, timeout=min(self.config.write_timeout + 0.5, self._remaining(deadline)))
+            done, pending = await asyncio.wait(closers, timeout=max(0.0, min(
+                self.config.write_timeout + 0.5, deadline - loop.time())))
             for task in done:
                 if not task.cancelled() and task.exception() is not None:
                     errors.append(str(task.exception()))
@@ -960,9 +962,10 @@ class PodSupervisor:
                         session.close_task.cancel()
                 for task in pending:
                     task.cancel()
+                    task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
                 errors.append("Router connections exceeded close deadline")
         if self._readers:
-            _, pending = await asyncio.wait(list(self._readers), timeout=min(1.0, self._remaining(deadline)))
+            _, pending = await asyncio.wait(list(self._readers), timeout=max(0.0, min(1.0, deadline - loop.time())))
             if pending:
                 errors.append("Router readers exceeded close deadline")
         tcp, websocket = self._tcp_server, self._websocket_server
@@ -972,13 +975,15 @@ class PodSupervisor:
                 continue
             try:
                 listener.close()
-                await asyncio.wait_for(listener.wait_closed(), min(self.config.write_timeout, self._remaining(deadline)))
+                await asyncio.wait_for(listener.wait_closed(), max(0.001, min(self.config.write_timeout, deadline - loop.time())))
             except Exception as exc:
                 errors.append(str(exc))
                 if listener is websocket:
                     for protocol in list(websocket.websockets):
                         protocol.transport.abort()
                         protocol.handler_task.cancel()
+                    if websocket.close_task is not None:
+                        websocket.close_task.cancel()
         self._pending_websockets.clear()
         if errors:
             raise RuntimeError("Router shutdown failed: {}".format("; ".join(errors)))
@@ -1060,15 +1065,22 @@ class _ControlReader:
 
     def _read(self):
         while not self.closed.is_set():
+            receive = None
             try:
                 raw = sys.stdin.buffer.readline(_CONTROL_LIMIT + 1)
                 if not raw:
                     self.eof.set()
-                self.pending = asyncio.run_coroutine_threadsafe(self.queue.put(raw), self.loop)
+                if self.closed.is_set() or self.loop.is_closed():
+                    return
+                receive = self.queue.put(raw)
+                self.pending = asyncio.run_coroutine_threadsafe(receive, self.loop)
+                receive = None
                 self.pending.result()
                 if not raw or len(raw) > _CONTROL_LIMIT or not raw.endswith(b"\n"):
                     return
             except Exception:
+                if receive is not None:
+                    receive.close()
                 return
 
     async def receive(self) -> Optional[dict]:

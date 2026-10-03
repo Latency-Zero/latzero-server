@@ -263,6 +263,7 @@ class LatZeroServer:
                                      and self._directory_lock.previous_owner_token != self._directory_owner_token)
                 self._directory_owner_token = self._directory_lock.owner_token
                 if not self._initial_storage_loaded or ownership_changed:
+                    self._initial_storage_loaded = False
                     self._pools.clear()
                     self._expiry_heap.clear()
                     self._store = SnapshotStore(self.config.data_dir,
@@ -708,7 +709,7 @@ class LatZeroServer:
     # ======================================================================
 
     async def _dispatch(self, session: ClientSession, message: dict) -> None:
-        if session.closed or session.closing:
+        if session.closed or session.closing or self._transport_closing(session):
             return
         self._msg_counter += 1
         self._metrics["dispatched"] += 1
@@ -785,7 +786,7 @@ class LatZeroServer:
         await self._ack(session.writer, message, {"left_pool": True})
 
     def _require_pool(self, session: ClientSession, message: dict) -> PoolState:
-        if session.closed or session.closing or not session.pool_id:
+        if session.closed or session.closing or self._transport_closing(session) or not session.pool_id:
             raise ValueError("Client is not in a pool")
         pool = self._pools.get(session.pool_id)
         if pool is None:
@@ -797,6 +798,8 @@ class LatZeroServer:
     # ── Pool handlers ──────────────────────────────────────────────────
 
     async def _handle_join_pool(self, session: ClientSession, message: dict) -> None:
+        if session.closed or session.closing or self._transport_closing(session):
+            return
         payload = message.get("payload") or {}
         client_id = payload.get("client_id") or message.get("client_id")
         pool_id = payload.get("pool") or message.get("pool")
@@ -1111,8 +1114,16 @@ class LatZeroServer:
         return route
 
     @staticmethod
+    def _transport_closing(session: ClientSession) -> bool:
+        transport = getattr(session.writer, "transport", None)
+        if transport is not None and hasattr(transport, "is_closing"):
+            return transport.is_closing()
+        return bool(getattr(session.writer, "closed", False))
+
+    @staticmethod
     def _session_matches(session: Optional[ClientSession], generation: int, pool: PoolState) -> bool:
         return (session is not None and not session.closed and not session.closing
+                and not LatZeroServer._transport_closing(session)
                 and session.generation == generation and session.pool_id == pool.pool_id
                 and pool.clients.get(session.client_id) is session)
 

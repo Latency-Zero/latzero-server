@@ -281,3 +281,36 @@ async def test_same_owner_restart_retains_existing_ephemeral_behavior(tmp_path):
         assert server._pools["owned"].buffers["ephemeral"].value == 42
     finally:
         await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_failed_handover_snapshot_load_remains_required_on_retry(tmp_path):
+    from latzero_server.models import BufferEntry, PoolState
+    from latzero_server.persistence import SnapshotStore
+    from latzero_server.directory_lock import DataDirectoryLock
+
+    server = LatZeroServer(ServerConfig(port=0, websocket_enabled=False, data_dir=tmp_path))
+    await server.start()
+    await server.stop()
+    next_owner = DataDirectoryLock(tmp_path).acquire()
+    try:
+        for pool_id in ("alpha", "beta"):
+            pool = PoolState(pool_id=pool_id, auth_required=True, auth_token_hash=pool_id)
+            pool.buffers["value"] = BufferEntry(value=pool_id, updated_at=1, updated_by="second", persistent=True)
+            await asyncio.get_running_loop().run_in_executor(None, SnapshotStore(tmp_path).save_pool, pool)
+    finally:
+        next_owner.release()
+    server.config.max_pools = 1
+    for _ in range(2):
+        with pytest.raises(ValueError, match="max_pools"):
+            await server.start()
+        assert not server._initial_storage_loaded
+        assert not server._accepting and server._tcp_server is None
+    server.config.max_pools = 2
+    await server.start()
+    try:
+        assert set(server._pools) == {"alpha", "beta"}
+        assert {pool_id: pool.auth_token_hash for pool_id, pool in server._pools.items()} == {"alpha": "alpha", "beta": "beta"}
+        assert {pool_id: pool.buffers["value"].value for pool_id, pool in server._pools.items()} == {"alpha": "alpha", "beta": "beta"}
+    finally:
+        await server.stop()
