@@ -809,7 +809,7 @@ async def test_real_python_node_browser_sdks_follow_pool_owner_and_switch_withou
                 python = await blocking(pod_python_sdk, "latzero://python-main", pool, port=cluster.tcp_port,
                                         timeout=8, callback_workers=1)
                 assert python.client_id == "python-main" and python.pool_name == pool
-                assert python._socket.getpeername()[1] == owner.port
+                assert python._sock.getpeername()[1] == owner.port
                 assert python._host == "127.0.0.1" and python._port == cluster.tcp_port
 
                 def calculate(a, b):
@@ -854,7 +854,7 @@ async def test_real_python_node_browser_sdks_follow_pool_owner_and_switch_withou
                         assert result["payload"]["value"] == {"owner": client_id, "kind": kind, "value": 9}
                 await blocking(python.subscribe_buffer, "python-old-subscription")
                 await blocking(python.switch_pool, target_pool, "target-token", timeout=6)
-                assert python._socket.getpeername()[1] == cluster.children[1].port
+                assert python._sock.getpeername()[1] == cluster.children[1].port
                 assert python.client_id == "python-main" and python.pool_name == target_pool
                 assert python._port == cluster.tcp_port
                 assert not python._processes

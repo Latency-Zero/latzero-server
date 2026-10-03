@@ -148,7 +148,7 @@ class PodCluster:
         from latzero_server.pods import PodSupervisor
 
         settings = dict(host="127.0.0.1", port=0, websocket_port=0, data_dir=data_dir,
-                        min_workers=2, max_workers=4, shutdown_timeout=5, write_timeout=3)
+                        min_workers=2, max_workers=4, shutdown_timeout=1, write_timeout=1)
         settings.update(options)
         self.config = ServerConfig(**settings)
         self.supervisor = PodSupervisor(self.config, pods, startup_timeout=30)
