@@ -85,6 +85,7 @@ async def test_same_pool_public_tcp_and_ws_connections_have_one_real_owner(tmp_p
             assert reply["payload"]["clients"] == sorted("affinity-%d" % index for index in range(number + 1))
             assert len(peer.visited) == 2
             assert len(peer.join_messages) == 2
+            assert all(message["client_id"] == peer.client_id for message in peer.join_messages)
             assert all(message["payload"] == {"client_id": peer.client_id, "pool": pool, "auth_token": None}
                        for message in peer.join_messages)
             assert (await peer.ack("hello", {"capabilities": ["pool_redirect_v1"]}))["pool"] == pool
@@ -121,6 +122,7 @@ async def test_four_owner_pools_isolate_membership_buffers_subscriptions_and_rou
             await recipient.ack("subscribe_buffer", {"key": "shared"})
             await worker.ack("register_process", {"process_name": "compute", "min_workers": 1, "max_workers": 1})
 
+        router_metrics = dict(cluster.snapshot()["metrics"])
         for index, (pool, origin, worker, recipient) in groups.items():
             value = {"pool": pool, "index": index, "values": [None, False, 0, "", "\u00e9\u96ea"]}
             await origin.ack("set_buffer", {"key": "shared", "value": value})
@@ -154,6 +156,7 @@ async def test_four_owner_pools_isolate_membership_buffers_subscriptions_and_rou
             assert item["metrics"]["accepted_calls"] == item["metrics"]["completed_calls"] == 2
             assert item["health_error"] is None and item["persistence"]["healthy"] is True
             assert item["pid"] == cluster.children[index].pid
+        assert cluster.snapshot()["metrics"] == router_metrics, "Steady-state pool operations must not be proxied by the public router"
 
 
 @pytest.mark.asyncio

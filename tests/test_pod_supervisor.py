@@ -482,6 +482,54 @@ async def test_child_control_health_pool_id_output_stays_bounded():
 
 
 @pytest.mark.asyncio
+async def test_control_reader_cancels_blocked_raw_read_without_pipe_eof(monkeypatch):
+    from types import SimpleNamespace
+    from latzero_server.pods import _ControlReader
+
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(fileno=lambda: read_fd))
+    reader = _ControlReader()
+    try:
+        assert await asyncio.get_running_loop().run_in_executor(None, reader.thread_ready.wait, 1)
+        assert reader.thread.is_alive()
+        await asyncio.wait_for(reader.wait_closed(), 2)
+        assert not reader.thread.is_alive()
+        assert reader.handle is None
+        await reader.wait_closed()
+    finally:
+        reader.close()
+        os.close(write_fd)
+        await reader.wait_closed()
+        os.close(read_fd)
+
+
+@pytest.mark.asyncio
+async def test_control_reader_split_coalesced_frames_and_pending_delivery_close(monkeypatch):
+    from types import SimpleNamespace
+    from latzero_server.pods import _ControlReader
+
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(fileno=lambda: read_fd))
+    reader = _ControlReader()
+    try:
+        frames = [{"config": "\u96ea"}, {"operation": "configure"}, {"operation": "stats"}]
+        raw = b"".join((json.dumps(frame, ensure_ascii=False) + "\n").encode("utf-8") for frame in frames)
+        os.write(write_fd, raw[:13])
+        os.write(write_fd, raw[13:])
+        assert await asyncio.wait_for(reader.receive(), 2) == frames[0]
+        assert await asyncio.wait_for(reader.receive(), 2) == frames[1]
+        assert await asyncio.wait_for(reader.receive(), 2) == frames[2]
+        os.write(write_fd, b"{}\n{}\n{}\n")
+        await asyncio.wait_for(reader.wait_closed(), 2)
+        assert not reader.thread.is_alive() and reader.queue.maxsize == 1
+    finally:
+        reader.close()
+        os.close(write_fd)
+        await reader.wait_closed()
+        os.close(read_fd)
+
+
+@pytest.mark.asyncio
 async def test_parent_crash_child_slot_blocks_new_root_until_flush_exits(tmp_path):
     process = await asyncio.create_subprocess_exec(sys.executable, str(Path(__file__).resolve()), "--orphan-parent", str(tmp_path),
                                                    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,

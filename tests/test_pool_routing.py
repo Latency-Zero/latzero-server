@@ -314,3 +314,36 @@ async def test_failed_handover_snapshot_load_remains_required_on_retry(tmp_path)
         assert {pool_id: pool.buffers["value"].value for pool_id, pool in server._pools.items()} == {"alpha": "alpha", "beta": "beta"}
     finally:
         await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_generated_join_presence_size_rejects_only_new_member(daemon):
+    server, connect = daemon
+    server.config.max_frame_bytes = 512
+    first, second, third = await connect(), await connect(), await connect()
+    first_id, second_id, third_id = "a" * 80, "b" * 80, "c" * 80
+    await first.join(first_id, "p")
+    await second.join(second_id, "p")
+    await third.request("hello")
+    rejected = await third.request("join_pool", {"client_id": third_id, "pool": "p"}, response="error")
+    assert rejected["payload"]["code"] == "response_too_large"
+    assert (await first.request("list_clients"))["payload"]["clients"] == [first_id, second_id]
+    assert (await second.request("list_clients"))["payload"]["clients"] == [first_id, second_id]
+    assert set(server._pools["p"].clients) == {first_id, second_id}
+    assert not server._pools["p"].clients[first_id].closing
+
+
+@pytest.mark.asyncio
+async def test_rejected_owner_local_switch_preserves_old_membership_and_auth(daemon):
+    server, connect = daemon
+    source, first, second = await connect(), await connect(), await connect()
+    source_id = "c" * 80
+    await source.join(source_id, "old", auth_token="secret")
+    await first.join("a" * 80, "p")
+    await second.join("b" * 80, "p")
+    server.config.max_frame_bytes = 512
+    rejected = await source.request("switch_pool", {"client_id": source_id, "pool": "p"}, response="error")
+    assert rejected["payload"]["code"] == "response_too_large"
+    assert (await source.request("list_clients"))["payload"]["clients"] == [source_id]
+    assert server._pools["old"].clients[source_id].pool_id == "old"
+    assert source_id not in server._pools["p"].clients

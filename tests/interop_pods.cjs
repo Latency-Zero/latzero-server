@@ -62,7 +62,7 @@ function browserClass() {
 }
 
 function record(client, browser) {
-    const item = { client, browser, hooks: new Feed(), updates: new Feed(), generation: 0 };
+    const item = { client, browser, hooks: new Feed(), updates: new Feed() };
     clients.set(client.clientId, item);
     if (browser) {
         client.addEventListener('error', event => errors.push({ client: client.clientId, message: event.detail.message }));

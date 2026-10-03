@@ -176,6 +176,8 @@ class PodCluster:
                                 waiter.set_result(message["stats"])
 
                         asyncio.get_running_loop().call_soon(observed)
+                else:
+                    child.process.stdout.readline = readline
                 return raw
 
             child.process.stdout.readline = observed_readline
@@ -272,8 +274,10 @@ class PodCluster:
             if hop == 0 and operation == "switch_pool":
                 assert peer.client_id == client_id
             else:
+                peer.client_id = client_id
                 hello = await peer.hello()
                 assert hello["payload"]["server"] == "latzero-server"
+                assert hello["client_id"] == client_id
             kind = operation if hop == 0 else "join_pool"
             message = peer.message(kind, {"client_id": client_id, "pool": pool, "auth_token": auth_token})
             join_messages.append(message)
@@ -304,9 +308,12 @@ class PodCluster:
         results = await asyncio.gather(*(peer.close() for peer in self.clients), return_exceptions=True)
         try:
             await asyncio.wait_for(self.supervisor.stop(), 40)
-        except RuntimeError:
+        except RuntimeError as exc:
             if not self.expect_shutdown_error:
-                raise
+                diagnostics = [{"index": child.index, "pid": child.pid,
+                                "code": child.process.returncode if child.process is not None else None,
+                                "stderr": "".join(child.stderr_tail)} for child in self.child_records]
+                raise AssertionError("%s; child diagnostics: %r" % (exc, diagnostics)) from exc
             assert self.snapshot()["healthy"] is False
         assert all(child.process is None or child.process.returncode is not None for child in self.child_records), "Supervisor did not reap every child"
         for result in results:

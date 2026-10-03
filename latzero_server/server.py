@@ -830,6 +830,7 @@ class LatZeroServer:
             return
 
         pool = self._pools.get(pool_id)
+        created = pool is None
         if pool is None:
             if len(self._pools) >= self.config.max_pools:
                 raise asyncio.QueueFull()
@@ -837,13 +838,6 @@ class LatZeroServer:
                 pool_id=pool_id,
                 auth_required=bool(auth_token),
                 auth_token_hash=self._hash_token(auth_token) if auth_token else None,
-            )
-            self._pools[pool_id] = pool
-            self._store.enqueue(pool)
-            self._record_event(
-                "info", "pool_created",
-                pool=pool_id, client_id=client_id,
-                extra={"auth_required": pool.auth_required},
             )
 
         if pool.auth_required:
@@ -863,9 +857,63 @@ class LatZeroServer:
                 "pool": pool_id, "auth_required": pool.auth_required, "clients": sorted(pool.clients),
             })
             return
-        if session.pool_id and session.pool_id != pool_id:
-            await self._disconnect(session, keep_connection=True)
 
+        clients = sorted([*pool.clients, client_id])
+        acknowledgement = encode_message({
+            "type": "ack", "request_id": message.get("request_id"), "client_id": client_id, "pool": pool_id,
+            "payload": {"pool": pool_id, "auth_required": pool.auth_required, "clients": clients},
+        })
+        presence = encode_message({
+            "type": "presence_update", "request_id": _next_id(), "client_id": client_id, "pool": pool_id,
+            "payload": {"event": "pool_clients_changed", "client_id": client_id, "status": "joined",
+                        "pool": pool_id, "clients": clients},
+        })
+        recipients = [*pool.clients.values(), session]
+        size = len(presence) + 64 * len(recipients)
+        departing_pool = self._pools.get(session.pool_id) if session.pool_id and session.pool_id != pool_id else None
+        departing = [recipient for recipient in departing_pool.clients.values() if recipient is not session] if departing_pool else []
+        departure = encode_message({
+            "type": "presence_update", "request_id": _next_id(), "client_id": client_id,
+            "pool": departing_pool.pool_id,
+            "payload": {"event": "pool_clients_changed", "client_id": client_id, "status": "left",
+                        "pool": departing_pool.pool_id, "clients": sorted(recipient.client_id for recipient in departing)},
+        }) if departing else None
+        departure_size = len(departure) + 64 * len(departing) if departure else 0
+        cfg = self.config
+        if max(len(acknowledgement), len(presence), len(departure or b"")) - 1 > cfg.max_frame_bytes:
+            await self._send_error(session.writer, message, "response_too_large", "Prospective pool membership exceeds the configured response maximum")
+            return
+        if (len(self._fanout_queue) + 1 + int(bool(departing)) > cfg.max_fanout_messages
+                or self._fanout_bytes + size + departure_size > cfg.max_fanout_bytes
+                or self._outbox_bytes + len(acknowledgement) + len(presence) * len(recipients)
+                   + len(departure or b"") * len(departing) > cfg.max_global_outbox_bytes
+                or any(recipient.closed or recipient.closing or self._transport_closing(recipient)
+                       or recipient.outbox_messages + (2 if recipient is session else 1) > cfg.max_outbox_messages
+                       or recipient.outbox_bytes + len(presence) + (len(acknowledgement) if recipient is session else 0) > cfg.max_outbox_bytes
+                       for recipient in recipients)
+                or any(recipient.closed or recipient.closing or self._transport_closing(recipient)
+                       or recipient.outbox_messages + 1 > cfg.max_outbox_messages
+                       or recipient.outbox_bytes + len(departure) > cfg.max_outbox_bytes for recipient in departing)):
+            await self._send_error(session.writer, message, "overloaded", "Pool membership notifications cannot be admitted without affecting existing members")
+            return
+
+        # Reserve every prospective notification before changing membership.
+        # These synchronous reservations cannot disconnect an existing member
+        # merely because a new join grows the full presence list.
+        self._reserve_encoded(session, acknowledgement, control=True)
+        generation = session.generation + int(bool(session.pool_id and session.pool_id != pool_id))
+        reserved = [(recipient, self._reserve_encoded(recipient, presence, ready=False,
+                    generation=generation if recipient is session else recipient.generation)) for recipient in recipients]
+        departed = [(recipient, self._reserve_encoded(recipient, departure, ready=False,
+                    generation=recipient.generation)) for recipient in departing]
+        if session.pool_id and session.pool_id != pool_id:
+            await self._disconnect(session, keep_connection=True, notify_presence=False)
+
+        if created:
+            self._pools[pool_id] = pool
+            self._store.enqueue(pool)
+            self._record_event("info", "pool_created", pool=pool_id, client_id=client_id,
+                               extra={"auth_required": pool.auth_required})
         session.client_id = client_id
         session.pool_id = pool_id
         pool.clients[client_id] = session
@@ -873,16 +921,12 @@ class LatZeroServer:
         if session.joined is not None:
             session.joined.set()
 
-        await self._ack(
-            session.writer,
-            message,
-            {
-                "pool": pool_id,
-                "auth_required": pool.auth_required,
-                "clients": sorted(pool.clients.keys()),
-            },
-        )
-        await self._broadcast_presence(pool, client_id, "joined")
+        if departed:
+            self._fanout_queue.append((departed, departure_size))
+        self._fanout_queue.append((reserved, size))
+        self._fanout_bytes += departure_size
+        self._fanout_bytes += size
+        self._fanout_ready.set()
         self._record_event("info", "client_joined", pool=pool_id, client_id=client_id)
 
     async def _handle_switch_pool(self, session: ClientSession, message: dict) -> None:
@@ -1501,7 +1545,7 @@ class LatZeroServer:
     # Disconnect / cleanup
     # ======================================================================
 
-    async def _disconnect(self, session: ClientSession, keep_connection: bool = False) -> None:
+    async def _disconnect(self, session: ClientSession, keep_connection: bool = False, notify_presence: bool = True) -> None:
         old_generation = session.generation
         session.generation += 1
         pool = self._pools.get(session.pool_id)
@@ -1523,7 +1567,8 @@ class LatZeroServer:
         for pid, registration in list(pool.processes.items()):
             if registration.owner_client_id == session.client_id:
                 pool.processes.pop(pid, None)
-        await self._broadcast_presence(pool, session.client_id, "left")
+        if notify_presence:
+            await self._broadcast_presence(pool, session.client_id, "left")
         self._record_event("info", "client_left", pool=pool.pool_id, client_id=session.client_id)
 
     def _fail_session(self, session: ClientSession, reason: str) -> None:

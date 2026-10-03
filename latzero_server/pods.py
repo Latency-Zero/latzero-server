@@ -530,7 +530,7 @@ class PodSupervisor:
             sys.executable, "-m", "latzero_server.pods", "--child",
         ]
         env = os.environ.copy()
-        env.update(PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
+        env.update(PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8", PYTHONFAULTHANDLER="1")
         package_root = str(Path(__file__).resolve().parent.parent)
         env["PYTHONPATH"] = package_root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
         creation = asyncio.create_task(asyncio.create_subprocess_exec(
@@ -1063,28 +1063,96 @@ class _ControlReader:
         self.closed = threading.Event()
         self.eof = threading.Event()
         self.pending = None
+        self._pending_lock = threading.Lock()
+        self.fd = sys.stdin.fileno()
+        self.handle = None
+        if os.name == "nt":
+            import ctypes
+            import msvcrt
+            from ctypes import wintypes
+
+            self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            self.kernel.GetCurrentThread.argtypes = ()
+            self.kernel.GetCurrentThread.restype = wintypes.HANDLE
+            self.kernel.GetCurrentProcess.argtypes = ()
+            self.kernel.GetCurrentProcess.restype = wintypes.HANDLE
+            self.kernel.DuplicateHandle.argtypes = (wintypes.HANDLE, wintypes.HANDLE, wintypes.HANDLE,
+                                                    ctypes.POINTER(wintypes.HANDLE), wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            self.kernel.DuplicateHandle.restype = wintypes.BOOL
+            self.kernel.CancelSynchronousIo.argtypes = (wintypes.HANDLE,)
+            self.kernel.CancelSynchronousIo.restype = wintypes.BOOL
+            self.kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+            self.kernel.CloseHandle.restype = wintypes.BOOL
+            pipe_handle = msvcrt.get_osfhandle(self.fd)
+            self.kernel.GetFileType.argtypes = (wintypes.HANDLE,)
+            self.kernel.GetFileType.restype = wintypes.DWORD
+            if self.kernel.GetFileType(pipe_handle) != 3:
+                raise ValueError("Pod control stdin must be a pipe")
+        self.thread_ready = threading.Event()
         self.thread = threading.Thread(target=self._read, name="latzero-pod-stdin", daemon=True)
         self.thread.start()
 
     def _read(self):
-        while not self.closed.is_set():
-            receive = None
-            try:
-                raw = sys.stdin.buffer.readline(_CONTROL_LIMIT + 1)
+        buffer = bytearray()
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            handle = wintypes.HANDLE()
+            process = self.kernel.GetCurrentProcess()
+            if self.kernel.DuplicateHandle(process, self.kernel.GetCurrentThread(), process,
+                                           ctypes.byref(handle), 0, False, 2):
+                self.handle = handle.value
+        self.thread_ready.set()
+        try:
+            while not self.closed.is_set():
+                if os.name != "nt":
+                    import select
+
+                    readable, _, _ = select.select([self.fd], [], [], 0.1)
+                    if not readable:
+                        continue
+                try:
+                    raw = os.read(self.fd, min(4096, _CONTROL_LIMIT + 1 - len(buffer)))
+                except OSError:
+                    raw = b""
                 if not raw:
                     self.eof.set()
-                if self.closed.is_set() or self.loop.is_closed():
+                    if buffer and not self.closed.is_set():
+                        self._deliver(bytes(buffer))
+                    self._deliver(b"")
                     return
+                buffer.extend(raw)
+                while b"\n" in buffer:
+                    boundary = buffer.index(b"\n") + 1
+                    frame = bytes(buffer[:boundary])
+                    del buffer[:boundary]
+                    if not self._deliver(frame):
+                        return
+                    if len(frame) > _CONTROL_LIMIT:
+                        return
+                if len(buffer) > _CONTROL_LIMIT:
+                    self._deliver(bytes(buffer))
+                    return
+        finally:
+            self.eof.set()
+
+    def _deliver(self, raw: bytes) -> bool:
+        receive = None
+        try:
+            with self._pending_lock:
+                if self.closed.is_set() or self.loop.is_closed():
+                    return False
                 receive = self.queue.put(raw)
                 self.pending = asyncio.run_coroutine_threadsafe(receive, self.loop)
                 receive = None
-                self.pending.result()
-                if not raw or len(raw) > _CONTROL_LIMIT or not raw.endswith(b"\n"):
-                    return
-            except Exception:
-                if receive is not None:
-                    receive.close()
-                return
+                pending = self.pending
+            pending.result()
+            return not self.closed.is_set()
+        except Exception:
+            if receive is not None:
+                receive.close()
+            return False
 
     async def receive(self) -> Optional[dict]:
         raw = await self.queue.get()
@@ -1098,9 +1166,27 @@ class _ControlReader:
         return message
 
     def close(self):
-        self.closed.set()
-        if self.pending is not None:
-            self.pending.cancel()
+        with self._pending_lock:
+            self.closed.set()
+            if self.pending is not None:
+                self.pending.cancel()
+        if self.handle is not None:
+            self.kernel.CancelSynchronousIo(self.handle)
+
+    async def wait_closed(self):
+        self.close()
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while self.thread.is_alive() and asyncio.get_running_loop().time() < deadline:
+            # Cancellation can race with the reader entering its next ReadFile.
+            if self.handle is not None:
+                self.kernel.CancelSynchronousIo(self.handle)
+            await asyncio.sleep(0.01)
+        if self.thread.is_alive():
+            raise RuntimeError("Pod control reader did not stop")
+        self.thread.join(timeout=0)
+        if self.handle is not None:
+            self.kernel.CloseHandle(self.handle)
+            self.handle = None
 
 
 class _ParentProcess:
@@ -1234,7 +1320,10 @@ async def _child_run(resources: dict) -> int:
         tasks = [task for task in (control_task, parent_task) if task is not None]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        reader.close()
+        try:
+            await reader.wait_closed()
+        except Exception as exc:
+            error = error or "Control shutdown failed: {}".format(exc)[:2048]
         if server is not None:
             server._accepting = False
             try:
