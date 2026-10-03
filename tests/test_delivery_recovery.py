@@ -7,6 +7,8 @@ import pytest
 
 from test_hardening import controlled_session, drain_outboxes, server_with_limits
 from latzero_server.models import PoolState
+from websockets.legacy.server import WebSocketServerProtocol
+from websockets.legacy.protocol import State
 
 
 @pytest.mark.asyncio
@@ -68,6 +70,27 @@ async def test_closed_transport_does_not_dispatch_buffered_membership_or_mutatio
         pending_writer.close()
         await server._dispatch(pending, {"type": "join_pool", "payload": {"client_id": "pending", "pool": "new"}})
         assert "new" not in server._pools
+
+
+@pytest.mark.asyncio
+async def test_websocket_close_handshake_fences_before_tcp_transport_closes(tmp_path):
+    async with server_with_limits(tmp_path) as (server, _):
+        pool = PoolState(pool_id="ws-closing")
+        server._pools[pool.pool_id] = pool
+        origin, _ = controlled_session(server, pool, "origin")
+        target, target_writer = controlled_session(server, pool, "target")
+        response, transport = controlled_session(server, pool, "response")
+        websocket = object.__new__(WebSocketServerProtocol)
+        websocket.state = State.CLOSING
+        websocket.transport = transport
+        response.writer = websocket
+        assert not websocket.open and not websocket.closed and not transport.is_closing()
+        route = server._accept_call(pool, origin, target, "echo", {"response_to": "response"}, {"request_id": "ws-unsent"})
+        await drain_outboxes(server)
+        assert not route.sent and not any(frame["type"] == "call_app" for frame in target_writer.frames)
+        await server._dispatch(response, {"type": "set_buffer", "payload": {"key": "not-written", "value": 42}})
+        assert not pool.buffers
+        response.writer = transport
 
 
 @pytest.mark.asyncio

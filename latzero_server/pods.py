@@ -141,6 +141,7 @@ class PodChild:
     _stats_requested: Any = field(default=None, repr=False)
     _stdout_eof: bool = field(default=False, repr=False)
     _stderr_eof: bool = field(default=False, repr=False)
+    _reaped: bool = field(default=False, repr=False)
 
 
 @dataclass
@@ -414,7 +415,7 @@ class PodSupervisor:
             if self._stop_task is not None and not self._stop_task.done():
                 raise RuntimeError("Previous pods are still stopping")
             if self._spawns or self._creations or self._directory_lock is not None or any(
-                child.process is not None and (child.process.returncode is None or not child._stdout_eof or not child._stderr_eof)
+                child.process is not None and not child._reaped
                 for child in self.children
             ):
                 raise RuntimeError("Previous pods have not been reaped")
@@ -650,7 +651,7 @@ class PodSupervisor:
         try:
             self._seal_ingress()
         except Exception as exc:
-            self._health_error += "; router seal failed: {}".format(exc)[:512]
+            self._health_error = (self._health_error + "; router seal failed: {}".format(exc))[:2048]
         if self._started and (self._failure_task is None or self._failure_task.done()):
             self._failure_task = asyncio.create_task(self.stop(), name="latzero-pod-failure-stop")
             self._failure_task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
@@ -660,17 +661,17 @@ class PodSupervisor:
             await asyncio.sleep(1.0)
 
             async def request(child):
-                if not child._stats_pending and child.process.returncode is None:
-                    child._stats_pending = True
-                    child._stats_requested = asyncio.get_running_loop().time()
-                    try:
+                try:
+                    if not child._stats_pending and child.process.returncode is None:
+                        child._stats_pending = True
+                        child._stats_requested = asyncio.get_running_loop().time()
                         await self._send_control(child, {"operation": "stats"})
-                    except (ConnectionError, OSError, asyncio.TimeoutError) as exc:
-                        self._child_failure(child, "Pod {} health control failed: {}".format(child.index, exc))
-                elif child._stats_requested is not None and asyncio.get_running_loop().time() - child._stats_requested > self.config.write_timeout:
-                    self._child_failure(child, "Pod {} health reply deadline exceeded".format(child.index))
-                if child.process.runtime is not None and not child.process.runtime.alive():
-                    self._child_failure(child, "Pod {} runtime exited unexpectedly".format(child.index))
+                    elif child._stats_requested is not None and asyncio.get_running_loop().time() - child._stats_requested > self.config.write_timeout:
+                        self._child_failure(child, "Pod {} health reply deadline exceeded".format(child.index))
+                    if child.process.runtime is not None and not child.process.runtime.alive():
+                        self._child_failure(child, "Pod {} runtime exited unexpectedly".format(child.index))
+                except Exception as exc:
+                    self._child_failure(child, "Pod {} health control failed: {}".format(child.index, exc))
 
             await asyncio.gather(*(request(child) for child in self.children))
 
@@ -742,6 +743,7 @@ class PodSupervisor:
                 raw = await asyncio.wait_for(websocket.recv(), self._remaining(session.deadline))
                 if not isinstance(raw, str):
                     session.frames += 1
+                    self._metrics["received"] += 1
                     await self._write(session, self._error(session, None, "protocol_error", "WebSocket frames must be text JSON"))
                     if session.frames >= self.config.max_session_messages:
                         break
@@ -918,8 +920,7 @@ class PodSupervisor:
                 if not task.cancelled() and task.exception() is not None:
                     errors.append(str(task.exception()))
             self._health_task = None
-        reaped = not self._spawns and not self._creations and all(child.process is None or child.process.returncode is not None
-                                           and child._stdout_eof and child._stderr_eof for child in self.children)
+        reaped = not self._spawns and not self._creations and all(child.process is None or child._reaped for child in self.children)
         if reaped and self._directory_lock is not None:
             try:
                 self._directory_lock.release()
@@ -995,6 +996,7 @@ class PodSupervisor:
         if process is None:
             child.status = "stopped"
             return
+        process.discover_runtimes()
         escalated = False
         if process.returncode is None:
             if child.status != "failed":
@@ -1029,6 +1031,7 @@ class PodSupervisor:
                 if not task.cancelled():
                     task.exception()
         stopped = child._stopped.result() if child._stopped.done() and not child._stopped.cancelled() else None
+        child._reaped = process.returncode is not None and child._stdout_eof and child._stderr_eof
         if escalated or process.returncode != 0 or not stopped or stopped.get("ok") is not True or not child._stdout_eof or not child._stderr_eof:
             child.status = "failed"
             error = "Pod {} did not stop cleanly (code {}, escalated {}, acknowledgement {})".format(

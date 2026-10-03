@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import weakref
 
 import pytest
 from websockets.exceptions import ConnectionClosed
@@ -382,6 +383,102 @@ async def test_failed_partial_spawn_cannot_leave_sibling_spawn_after_cleanup(tmp
     assert all(child.process is None or child.process.returncode is not None for child in supervisor.children)
     with DataDirectoryLock(tmp_path):
         pass
+
+
+class _MemoryTransport:
+    def __init__(self):
+        self.closed = False
+
+    def abort(self):
+        self.closed = True
+
+    def close(self):
+        self.closed = True
+
+
+class _MemoryWriter:
+    def __init__(self, stalled=False):
+        self.transport = _MemoryTransport()
+        self.frames = []
+        self.stalled = stalled
+
+    def write(self, frame):
+        self.frames.append(frame)
+
+    async def drain(self):
+        if self.stalled:
+            await asyncio.Future()
+
+    def close(self):
+        self.transport.close()
+
+    async def wait_closed(self):
+        if self.stalled:
+            await asyncio.Future()
+
+
+@pytest.mark.asyncio
+async def test_router_write_deadline_stalled_close_and_references_are_bounded(tmp_path):
+    import gc
+
+    supervisor = PodSupervisor(_config(tmp_path, write_timeout=0.05), 2)
+    writer = _MemoryWriter(stalled=True)
+    session = supervisor._new_session(writer, asyncio.get_running_loop().time() + 2)
+    with pytest.raises(asyncio.TimeoutError):
+        await supervisor._write(session, {"type": "ack", "request_id": "id", "payload": {}})
+    assert len(writer.frames) == 1
+    await asyncio.wait_for(supervisor._close_session(session), 1)
+    assert writer.transport.closed
+    assert supervisor._connection_count == 0 and not supervisor._sessions
+    reference = weakref.ref(session)
+    del session, writer
+    gc.collect()
+    assert reference() is None
+
+
+@pytest.mark.asyncio
+async def test_router_only_membership_requests_validated_before_redirect(tmp_path):
+    supervisor = PodSupervisor(_config(tmp_path, max_frame_bytes=1024, max_session_messages=6), 2)
+    supervisor._routing = PoolRouting(0, 2)
+    supervisor._routing.configure([{"host": "127.0.0.1", "port": 1, "ws_port": None},
+                                   {"host": "127.0.0.1", "port": 2, "ws_port": None}], "127.0.0.1", 3, None, "cluster")
+    writer = _MemoryWriter()
+    session = supervisor._new_session(writer, asyncio.get_running_loop().time() + 2)
+    try:
+        frames = [
+            {"type": "hello", "client_id": "id", "request_id": "h", "payload": {"capabilities": ["pool_redirect_v1"]}},
+            {"type": "set_buffer", "request_id": "set", "payload": {"key": "k", "value": 1}},
+            {"type": "join_pool", "request_id": "alias", "client_id": "id", "pool": "outer", "payload": {"pool": "inner"}},
+            {"type": "join_pool", "request_id": "identity", "client_id": "other", "pool": "pool", "payload": {}},
+            {"type": "join_pool", "request_id": "auth", "client_id": "id", "pool": "pool", "payload": {"auth_token": 2}},
+            {"type": "join_pool", "request_id": "join", "client_id": "id", "pool": "pool", "payload": {"auth_token": "wrong"}},
+        ]
+        for frame in frames:
+            await supervisor._route_frame(session, json.dumps(frame))
+        replies = [json.loads(frame) for frame in writer.frames]
+        assert [reply["type"] for reply in replies] == ["ack", "error", "error", "error", "error", "redirect"]
+        assert [reply["payload"].get("code") for reply in replies[1:5]] == ["not_joined", "protocol_error", "identity_change", "protocol_error"]
+        assert replies[-1]["request_id"] == "join" and session.closing
+        assert replies[-1]["payload"]["protocol"] == "pool_redirect_v1"
+        assert not list(tmp_path.glob("pool-*.json"))
+    finally:
+        await supervisor._close_session(session)
+
+
+@pytest.mark.asyncio
+async def test_child_control_health_pool_id_output_stays_bounded():
+    from types import SimpleNamespace
+    from latzero_server.pods import _child_health, _control_frame, _CONTROL_LIMIT
+
+    pools = {("pool-%d-" % index) + "\u96ea" * 160: None for index in range(1024)}
+    server = SimpleNamespace(_pools=pools, _connection_count=0, _pending_websockets={}, _health_error=None,
+                             _metrics={}, _store=SimpleNamespace(health={"healthy": True}))
+    stats = _child_health(server, PoolRouting(0, 2))
+    assert stats["pools"] == 1024 and stats["pool_ids_truncated"] is True
+    assert len(_control_frame({"stats": stats})) <= _CONTROL_LIMIT
+    assert 0 < len(stats["pool_ids"]) < 1024
+    with pytest.raises(ValueError, match="64 KiB"):
+        _control_frame({"data": "x" * _CONTROL_LIMIT})
 
 
 @pytest.mark.asyncio

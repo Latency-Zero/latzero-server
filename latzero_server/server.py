@@ -1115,6 +1115,8 @@ class LatZeroServer:
 
     @staticmethod
     def _transport_closing(session: ClientSession) -> bool:
+        if isinstance(session.writer, WebSocketServerProtocol) and not session.writer.open:
+            return True
         transport = getattr(session.writer, "transport", None)
         if transport is not None and hasattr(transport, "is_closing"):
             return transport.is_closing()
