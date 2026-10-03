@@ -173,4 +173,5 @@ class ClientSession:
     joined: Any = None
     joined_once: bool = False
     close_task: Any = None
+    redirect_supported: bool = False
 

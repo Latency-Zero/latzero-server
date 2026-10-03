@@ -88,9 +88,11 @@ class _LimitedWebSocketProtocol(WebSocketServerProtocol):
 class LatZeroServer:
     """Local TCP and WebSocket server for LatZero server mode."""
 
-    def __init__(self, config: Optional[ServerConfig] = None):
+    def __init__(self, config: Optional[ServerConfig] = None, *, pool_routing: Any = None):
         self.config = config or ServerConfig()
         self.config.validate()
+        self._pool_routing = pool_routing
+        self._directory_lock = None
         self._pools: Dict[str, PoolState] = {}
         self._tcp_server: Optional[asyncio.base_events.Server] = None
         self._websocket_server: Optional[WebSocketServer] = None
@@ -196,6 +198,8 @@ class LatZeroServer:
     def _load_snapshots(self) -> None:
         wall_now, monotonic_now = time.time(), time.monotonic()
         for pool_id, snapshot in self._store.load_pools().items():
+            if self._pool_routing is not None and not self._pool_routing.owns(pool_id):
+                continue
             if len(self._pools) >= self.config.max_pools:
                 raise ValueError("Restored snapshots exceed max_pools")
             pool = PoolState(
@@ -237,6 +241,10 @@ class LatZeroServer:
         if ws_port is None:
             ws_port = self.config.port + 1 if self.config.port else 0
         try:
+            if self._pool_routing is None:
+                from .directory_lock import DataDirectoryLock
+
+                self._directory_lock = DataDirectoryLock(self.config.data_dir).acquire()
             self._store.start()
             await self._worker_pool.start()
             self._fanout_ready = asyncio.Event()
@@ -381,6 +389,9 @@ class LatZeroServer:
             await self._store.stop()
         except Exception as exc:
             errors.append(exc)
+        if self._directory_lock is not None and not self._store.health["running"] and not self._store.health["in_flight"]:
+            self._directory_lock.release()
+            self._directory_lock = None
         if errors:
             self._health_error = f"Shutdown failed: {errors[0]}"
             self._record_event("error", "shutdown_failed", extra={"errors": [str(exc) for exc in errors]})
@@ -725,7 +736,14 @@ class LatZeroServer:
     # ======================================================================
 
     async def _handle_hello(self, session: ClientSession, message: dict) -> None:
-        await self._ack(session.writer, message, {"server": "latzero-server"})
+        capabilities = (message.get("payload") or {}).get("capabilities", [])
+        if not isinstance(capabilities, list) or any(not isinstance(item, str) for item in capabilities):
+            raise ValueError("capabilities must be an array of strings")
+        session.redirect_supported = "pool_redirect_v1" in capabilities
+        await self._ack(session.writer, message, {
+            "server": "latzero-server",
+            **({"capabilities": ["pool_redirect_v1"]} if self._pool_routing is not None else {}),
+        })
 
     async def _handle_leave_pool(self, session: ClientSession, message: dict) -> None:
         await self._disconnect(session, keep_connection=True)
@@ -755,6 +773,21 @@ class LatZeroServer:
             raise ValueError("auth_token must be a string or null")
         if session.client_id and session.client_id != client_id:
             await self._send_error(session.writer, message, "identity_change", "Client identity is stable for the connection")
+            return
+
+        if self._pool_routing is not None and not self._pool_routing.owns(pool_id):
+            payload = self._pool_routing.redirect_payload(pool_id)
+            self._write_nowait(session.writer, {
+                "type": "redirect" if session.redirect_supported else "error",
+                "request_id": message.get("request_id"), "client_id": client_id, "pool": pool_id,
+                "payload": payload if session.redirect_supported else {
+                    "code": "redirect_required", "message": "This pool is owned by another pod; use a redirect-capable SDK",
+                    **payload,
+                },
+            })
+            session.closing = True
+            self._worker_pool.invalidate(session)
+            session.close_task = self._track(self._finish_close(session), "latzero-redirect-close")
             return
 
         pool = self._pools.get(pool_id)
@@ -1717,7 +1750,7 @@ class LatZeroServer:
             return False
         msg_type = message.get("type")
         return self._reserve_encoded(
-            session, encoded, control=msg_type in {"ack", "error", "app_result", "process_scale"},
+            session, encoded, control=msg_type in {"ack", "error", "redirect", "app_result", "process_scale"},
             generation=session.generation if msg_type in {"call_app", "emit_event", "app_result", "process_scale", "buffer_update", "presence_update"} else None,
         ) is not None
 
