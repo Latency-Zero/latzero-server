@@ -65,6 +65,55 @@ This starts TCP on `127.0.0.1:14130`. Keep this terminal running.
 
 `--headless` is the default; it is explicit here for clarity. `--no-ws` disables the browser listener for this first example.
 
+### Pool-Affine Pods
+
+For multiple independent pools, start a local supervisor and four daemon processes:
+
+```bash
+latzero-server --headless --pods 4
+```
+
+The public TCP port remains `14130` and the optional WS entry port remains
+`14131`. The supervisor accepts `hello`/`join_pool` and redirects the connection
+to the pool's owner. Every connection for the exact same pool name uses the same
+owner: `int.from_bytes(SHA256(pool.encode('utf-8')).digest(), 'big') % pods`.
+Steady-state data goes directly to the selected pod, not through a proxy or a
+cross-pod forwarding layer. Internal pod listeners bind loopback ephemeral ports.
+SDKs connect through the public entry point; do not persist internal pod ports as
+application configuration.
+
+Use redirect-capable versions of all Python, Node, browser and Rust SDKs. They
+advertise `pool_redirect_v1`, validate local owner endpoints, bound redirect hops,
+and keep one connection deadline across the initial join. Older clients receive
+`redirect_required` rather than an incorrect isolated pool or a silent timeout.
+The feature is loopback-only; it does not authorize remote clients, add TLS, or
+provide a multi-machine cluster. The original `--pods 1` single-daemon path and
+wire operations remain supported.
+
+| Pod Boundary | Behavior |
+| --- | --- |
+| One pool | Exactly one owner process; buffers, handlers, subscriptions and routes stay together |
+| One hot pool | Still one event-loop CPU domain; more pods do not split it |
+| Many pools | Can execute in parallel across pod processes; skew/collisions and workload affect gains |
+| Pool switch | May replace the transport; old-pool work/registrations are quiesced, never replayed |
+| Failure | Unexpected pod departure makes the cluster unhealthy and fails closed; no live remap/failover |
+| Pod count | Fixed during a run; changing it requires full graceful stop/restart |
+| State directory | Existing exact-identity snapshot files stay in one directory; each pod loads/writes only its owned pools |
+| Persistent data | Remains eventual snapshot state; changing pod count does not make ACKs crash-durable |
+| Dashboard | `--tui` is supported only by the single-daemon path in this release |
+
+A cross-platform directory lock rejects a second live daemon/supervisor writing
+the same state directory. Child ownership locks remain held through shutdown and
+file I/O, including parent-loss teardown. Legacy snapshots are preserved, not
+rewritten into per-pod folders. Back up persistent state before changing binaries
+or pod count, and stop all owners before restarting. Limits such as route/queue
+budgets apply per pod, with separate bounded admission at the public router.
+
+Browser pages need their explicit Origin permitted by the entry router and pods
+using the existing `--ws-origin` flag; redirecting the WS endpoint does not change
+the page Origin. File-page `null` remains an explicit opt-in. Pod scaling is
+validated with multiple pools, not inferred from the earlier single-pool mesh.
+
 ### 2. Connect Two Clients
 
 The Node SDK documents Node **18+**; its package has no external dependencies or build step.

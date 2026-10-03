@@ -95,6 +95,7 @@ class LatZeroServer:
         self._directory_lock = None
         self._storage_started = False
         self._initial_storage_loaded = pool_routing is not None
+        self._storage_stop_attempted = False
         self._pools: Dict[str, PoolState] = {}
         self._tcp_server: Optional[asyncio.base_events.Server] = None
         self._websocket_server: Optional[WebSocketServer] = None
@@ -209,12 +210,13 @@ class LatZeroServer:
                 auth_required=snapshot.get("auth_required", False),
                 auth_token_hash=snapshot.get("auth_token_hash"),
             )
+            removed_expired = False
             for key, payload in snapshot.get("buffers", {}).items():
                 entry = BufferEntry.from_dict(payload)
                 if entry.ttl is not None:
                     remaining = entry.updated_at + entry.ttl - wall_now
                     if remaining <= 0:
-                        self._store.enqueue(pool)
+                        removed_expired = True
                         continue
                     entry.expires_at = monotonic_now + remaining
                     heapq.heappush(self._expiry_heap, (entry.expires_at, pool_id, key, entry.version))
@@ -224,6 +226,8 @@ class LatZeroServer:
             if len(pool.buffers) > self.config.max_buffers_per_pool or pool.buffer_bytes > self.config.max_pool_bytes:
                 raise ValueError(f"Restored pool '{pool_id}' exceeds configured state limits")
             self._pools[pool_id] = pool
+            if removed_expired:
+                self._store.enqueue(pool)
 
     async def start(self) -> None:
         if self._lifecycle_lock is None:
@@ -262,6 +266,7 @@ class LatZeroServer:
                     raise RuntimeError("Previous snapshot writer has not stopped; refusing unsafe restart")
             self._store.start()
             self._storage_started = True
+            self._storage_stop_attempted = False
             await self._worker_pool.start()
             self._fanout_ready = asyncio.Event()
             self._fanout_task = self._track(self._fanout_loop(), "latzero-fanout")
@@ -403,10 +408,16 @@ class LatZeroServer:
         self._fanout_bytes = 0
         try:
             if self._storage_started:
+                if (self._storage_stop_attempted and self._store.health["dirty_pools"]
+                        and not self._store.health["running"] and not self._store.health["in_flight"]):
+                    self._store.start()
+                self._storage_stop_attempted = True
                 await self._store.stop()
         except Exception as exc:
             errors.append(exc)
-        if self._directory_lock is not None and not self._store.health["running"] and not self._store.health["in_flight"]:
+        if (self._directory_lock is not None and not self._store.health["running"]
+                and not self._store.health["in_flight"]
+                and (not self._storage_started or not self._store.health["dirty_pools"])):
             self._directory_lock.release()
             self._directory_lock = None
         if errors:
@@ -804,7 +815,8 @@ class LatZeroServer:
             })
             session.closing = True
             self._worker_pool.invalidate(session)
-            session.close_task = self._track(self._finish_close(session), "latzero-redirect-close")
+            if session.close_task is None:
+                session.close_task = self._track(self._finish_close(session), "latzero-redirect-close")
             return
 
         pool = self._pools.get(pool_id)

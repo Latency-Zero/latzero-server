@@ -112,3 +112,48 @@ async def test_preconstructed_daemon_recaptures_snapshot_under_owner_lock(tmp_pa
         assert server._pools["new"].buffers["saved"].value == 42
     finally:
         await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_failed_snapshot_flush_keeps_directory_owned_until_successful_retry(tmp_path, monkeypatch):
+    from latzero_server.directory_lock import DataDirectoryLock
+    from latzero_server.models import PoolState
+
+    server = LatZeroServer(ServerConfig(port=0, websocket_enabled=False, data_dir=tmp_path))
+    await server.start()
+    server._store._shutdown_max_retries = 1
+    original = server._store._write_file
+
+    def fail(snapshot):
+        raise OSError("injected storage failure")
+
+    monkeypatch.setattr(server._store, "_write_file", fail)
+    server._store.enqueue(PoolState(pool_id="dirty"))
+    with pytest.raises(Exception, match="injected storage failure"):
+        await server.stop()
+    assert server._directory_lock is not None
+    with pytest.raises((OSError, RuntimeError)):
+        DataDirectoryLock(tmp_path).acquire()
+    monkeypatch.setattr(server._store, "_write_file", original)
+    await server.stop()
+    assert server._directory_lock is None
+    lock = DataDirectoryLock(tmp_path).acquire()
+    lock.release()
+
+
+@pytest.mark.asyncio
+async def test_single_daemon_lock_blocks_second_daemon_without_altering_first(tmp_path):
+    first = LatZeroServer(ServerConfig(port=0, websocket_enabled=False, data_dir=tmp_path))
+    second = LatZeroServer(ServerConfig(port=0, websocket_enabled=False, data_dir=tmp_path))
+    await first.start()
+    try:
+        with pytest.raises((OSError, RuntimeError)):
+            await second.start()
+        assert first._tcp_server.is_serving()
+        assert first._directory_lock is not None
+        assert second._directory_lock is None
+    finally:
+        await second.stop()
+        await first.stop()
+    await second.start()
+    await second.stop()
