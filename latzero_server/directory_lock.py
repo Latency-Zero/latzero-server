@@ -88,7 +88,11 @@ class DataDirectoryLock:
                     entry = _REGISTRY.get(identity)
                     if entry is None:
                         if stat.st_size < _MAX_SLOTS + 1:
-                            os.ftruncate(fd, _MAX_SLOTS + 1)
+                            # Extending mustn't truncate a root token written
+                            # since this descriptor's initial size check.
+                            os.lseek(fd, _MAX_SLOTS, os.SEEK_SET)
+                            if os.write(fd, b"\x00") != 1:
+                                raise OSError("Incomplete lock file initialization")
                         entry = {"fd": fd, "fds": [fd], "held": set(), "paths": set()}
                         _REGISTRY[identity] = entry
                     else:

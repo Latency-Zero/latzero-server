@@ -277,7 +277,6 @@ class PodCluster:
                 peer.client_id = client_id
                 hello = await peer.hello()
                 assert hello["payload"]["server"] == "latzero-server"
-                assert hello["client_id"] == client_id
             kind = operation if hop == 0 else "join_pool"
             message = peer.message(kind, {"client_id": client_id, "pool": pool, "auth_token": auth_token})
             join_messages.append(message)

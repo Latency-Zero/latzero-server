@@ -1064,6 +1064,7 @@ class _ControlReader:
         self.eof = threading.Event()
         self.pending = None
         self._pending_lock = threading.Lock()
+        self.read_error = None
         self.fd = sys.stdin.fileno()
         self.handle = None
         if os.name == "nt":
@@ -1103,6 +1104,11 @@ class _ControlReader:
             if self.kernel.DuplicateHandle(process, self.kernel.GetCurrentThread(), process,
                                            ctypes.byref(handle), 0, False, 2):
                 self.handle = handle.value
+            else:
+                self.read_error = "Cannot acquire a cancellable control reader thread handle"
+                self.thread_ready.set()
+                self._deliver(b"")
+                return
         self.thread_ready.set()
         try:
             while not self.closed.is_set():
@@ -1114,7 +1120,9 @@ class _ControlReader:
                         continue
                 try:
                     raw = os.read(self.fd, min(4096, _CONTROL_LIMIT + 1 - len(buffer)))
-                except OSError:
+                except OSError as exc:
+                    if not self.closed.is_set():
+                        self.read_error = "Pod control read failed: {}".format(exc)[:512]
                     raw = b""
                 if not raw:
                     self.eof.set()
@@ -1156,6 +1164,8 @@ class _ControlReader:
 
     async def receive(self) -> Optional[dict]:
         raw = await self.queue.get()
+        if self.read_error:
+            raise RuntimeError(self.read_error)
         if not raw:
             return None
         if len(raw) > _CONTROL_LIMIT or not raw.endswith(b"\n"):
