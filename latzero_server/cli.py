@@ -15,6 +15,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the local LatZero TCP/WebSocket daemon")
     parser.add_argument("--host", default="127.0.0.1", help="Bind host")
     parser.add_argument("--port", type=int, default=14130, help="Bind port")
+    parser.add_argument("--pods", type=int, default=1, help="Pool-affine daemon processes behind the local redirect router (default: 1)")
+    parser.add_argument("--pod-child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--no-ws", action="store_true", help="Disable the WebSocket listener")
     parser.add_argument("--ws-port", type=int, default=None, help="WebSocket port (default: TCP port + 1)")
     parser.add_argument(
@@ -62,6 +64,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 async def _run(args: argparse.Namespace) -> None:
+    pods = getattr(args, "pods", 1)
+    if isinstance(pods, bool) or not isinstance(pods, int) or not 1 <= pods <= 64:
+        raise ValueError("pods must be an integer from 1 to 64")
+    if args.tui and pods != 1:
+        raise ValueError("--tui is currently available only for a single daemon; use --headless with --pods")
     if args.tui:
         try:
             from .tui import ServerDashboard
@@ -85,14 +92,20 @@ async def _run(args: argparse.Namespace) -> None:
         websocket_port=args.ws_port if args.ws_port is not None else defaults.websocket_port,
         websocket_origins=defaults.websocket_origins + (args.ws_origin or []),
     )
-    server = LatZeroServer(config=config)
+    if pods == 1:
+        server = LatZeroServer(config=config)
+    else:
+        from .pods import PodSupervisor
+
+        server = PodSupervisor(config, pods)
     try:
         await server.start()
 
         if not args.tui:
+            port = server.tcp_port if pods != 1 else server._tcp_server.sockets[0].getsockname()[1]
             print(
-                f"latzero-server listening on {config.host}:{config.port} "
-                f"(data-dir: {config.data_dir})",
+                f"latzero-server listening on {config.host}:{port} "
+                f"(pods: {pods}, data-dir: {config.data_dir})",
                 file=sys.stdout,
                 flush=True,
             )
@@ -107,6 +120,10 @@ async def _run(args: argparse.Namespace) -> None:
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.pod_child:
+        from .pods import child_main
+
+        return child_main()
     try:
         asyncio.run(_run(args))
     except KeyboardInterrupt:

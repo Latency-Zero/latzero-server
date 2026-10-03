@@ -93,6 +93,8 @@ class LatZeroServer:
         self.config.validate()
         self._pool_routing = pool_routing
         self._directory_lock = None
+        self._storage_started = False
+        self._initial_storage_loaded = pool_routing is not None
         self._pools: Dict[str, PoolState] = {}
         self._tcp_server: Optional[asyncio.base_events.Server] = None
         self._websocket_server: Optional[WebSocketServer] = None
@@ -245,7 +247,18 @@ class LatZeroServer:
                 from .directory_lock import DataDirectoryLock
 
                 self._directory_lock = DataDirectoryLock(self.config.data_dir).acquire()
+                # Constructor inspection is read-only state. Re-capture under
+                # ownership before opening listeners so a preconstructed daemon
+                # cannot start from snapshots changed by a previous owner.
+                if not self._initial_storage_loaded:
+                    self._pools.clear()
+                    self._expiry_heap.clear()
+                    self._store = SnapshotStore(self.config.data_dir,
+                        batch_window=self.config.persistence_batch_window, max_dirty_pools=self.config.max_pools)
+                    self._load_snapshots()
+                    self._initial_storage_loaded = True
             self._store.start()
+            self._storage_started = True
             await self._worker_pool.start()
             self._fanout_ready = asyncio.Event()
             self._fanout_task = self._track(self._fanout_loop(), "latzero-fanout")
@@ -386,7 +399,8 @@ class LatZeroServer:
         self._fanout_queue.clear()
         self._fanout_bytes = 0
         try:
-            await self._store.stop()
+            if self._storage_started:
+                await self._store.stop()
         except Exception as exc:
             errors.append(exc)
         if self._directory_lock is not None and not self._store.health["running"] and not self._store.health["in_flight"]:
