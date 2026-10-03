@@ -85,6 +85,15 @@ def test_lock_root_child_slots_and_retained_inode(tmp_path):
         with pytest.raises(DataDirectoryLockError):
             DataDirectoryLock(tmp_path).acquire()
         sibling.release()
+        with DataDirectoryLock(tmp_path) as restarted:
+            assert restarted.acquired
+            assert restarted.path.stat().st_ino == inode
+            assert restarted.path.stat().st_size >= 65
+        restarted.release()
+    finally:
+        root.release()
+        child.release()
+        sibling.release()
 
 
 def test_lock_root_epoch_ignores_children_and_failed_acquisitions(tmp_path):
@@ -101,15 +110,6 @@ def test_lock_root_epoch_ignores_children_and_failed_acquisitions(tmp_path):
         second_token = second.owner_token
     with DataDirectoryLock(tmp_path) as third:
         assert third.previous_owner_token == second_token
-        with DataDirectoryLock(tmp_path) as restarted:
-            assert restarted.acquired
-            assert restarted.path.stat().st_ino == inode
-            assert restarted.path.stat().st_size >= 65
-        restarted.release()
-    finally:
-        root.release()
-        child.release()
-        sibling.release()
 
 
 @pytest.mark.parametrize("slot", [-1, 64, True, 0.0, "0"])
@@ -197,9 +197,7 @@ async def test_real_pods_router_readiness_redirect_and_restart(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_forced_child_termination_reaps_runtime_and_seals_cluster(tmp_path, monkeypatch):
-    import latzero_server.pods as module
-
+async def test_forced_child_termination_reaps_runtime_and_seals_cluster(tmp_path):
     supervisor = PodSupervisor(_config(tmp_path, websocket_enabled=False), 2)
     await supervisor.start()
     child = supervisor.children[0]
@@ -232,17 +230,10 @@ async def test_stop_escalation_handles_actual_runtime_not_only_venv_launcher(tmp
     supervisor = PodSupervisor(_config(tmp_path, websocket_enabled=False), 2)
     await supervisor.start()
     actual = [child.process.runtime for child in supervisor.children]
-    original = module._PodProcess.wait
-
-    async def ignore_first_wait(process):
-        if process.launcher.returncode is None:
-            await asyncio.Future()
-        return await original(process)
-
     # Suppress the STOP frame and EOF until escalation, without replacing the
     # production subprocess/handle termination implementation.
     async def no_stop(child, message, deadline=None):
-        await asyncio.Future()
+        raise asyncio.TimeoutError()
 
     monkeypatch.setattr(supervisor, "_send_control", no_stop)
     for child in supervisor.children:
@@ -282,12 +273,15 @@ async def test_parent_crash_child_slot_blocks_new_root_until_flush_exits(tmp_pat
         await asyncio.wait_for(process.wait(), 5)
         with pytest.raises(DataDirectoryLockError):
             DataDirectoryLock(tmp_path).acquire()
+        reader, writer = await asyncio.open_connection("127.0.0.1", parent_record["drain_port"])
+        assert await asyncio.wait_for(reader.readline(), 5) == b"draining\n"
+        await _send(writer, {"operation": "release"})
+        assert await asyncio.wait_for(reader.read(), 5) == b""
+        writer.close()
+        await writer.wait_closed()
         if child_handle is not None:
-            child_handle.terminate()
             await asyncio.get_running_loop().run_in_executor(None, child_handle.kernel.WaitForSingleObject, child_handle.handle, 5000)
             assert not child_handle.alive()
-        else:
-            os.kill(lease["pid"], 15)
         with DataDirectoryLock(tmp_path):
             pass
     finally:
@@ -408,14 +402,59 @@ if __name__ == "__main__" and sys.argv[1] == "--lease":
         sys.stdin.buffer.read()
 elif __name__ == "__main__" and sys.argv[1] == "--orphan-parent":
     import subprocess
+    from dataclasses import asdict
 
     root = DataDirectoryLock(Path(sys.argv[2])).acquire()
-    lease_process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--lease", sys.argv[2], "0"],
+    lease_process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--draining-pod"],
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    drain = json.loads(lease_process.stdout.readline())
+    config = asdict(_config(Path(sys.argv[2]), websocket_enabled=False))
+    config["data_dir"] = sys.argv[2]
+    lease_process.stdin.write((json.dumps({"config": config, "index": 0, "pods": 1, "parent_pid": os.getpid()}) + "\n").encode())
+    lease_process.stdin.flush()
     lease = json.loads(lease_process.stdout.readline())
-    print(json.dumps({"pid": os.getpid(), "lease": lease}), flush=True)
+    lease_process.stdin.write((json.dumps({"operation": "configure", "endpoints": [{"host": "127.0.0.1", "port": lease["port"], "ws_port": None}],
+                                         "router_host": "127.0.0.1", "router_port": lease["port"], "router_ws_port": None, "cluster_id": "fixture"}) + "\n").encode())
+    lease_process.stdin.flush()
+    assert json.loads(lease_process.stdout.readline())["configured"] is True
+    print(json.dumps({"pid": os.getpid(), "lease": lease, "drain_port": drain["port"]}), flush=True)
     sys.stdin.buffer.readline()
-    # Keep the lease child's input write handle inherited by a detached
-    # grandchild, simulating a slow surviving writer after root owner crash.
-    os.set_handle_inheritable(lease_process.stdin.fileno(), True) if os.name == "nt" else None
     os._exit(0)
+elif __name__ == "__main__" and sys.argv[1] == "--draining-pod":
+    from latzero_server.pods import _child_run
+    from latzero_server.server import LatZeroServer
+
+    async def draining_child():
+        release = asyncio.Event()
+        draining = asyncio.Event()
+        original = LatZeroServer.stop
+
+        async def stop(server):
+            draining.set()
+            await asyncio.wait_for(release.wait(), 10)
+            await original(server)
+
+        async def allow_stop(reader, writer):
+            try:
+                await asyncio.wait_for(draining.wait(), 5)
+                writer.write(b"draining\n")
+                await writer.drain()
+                await reader.readline()
+                release.set()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        LatZeroServer.stop = stop
+        listener = await asyncio.start_server(allow_stop, "127.0.0.1", 0)
+        print(json.dumps({"port": listener.sockets[0].getsockname()[1]}), flush=True)
+        resources = {"lock": None, "io_stopped": False}
+        try:
+            return await _child_run(resources)
+        finally:
+            listener.close()
+            await listener.wait_closed()
+            if resources["lock"] is not None:
+                resources["lock"].release()
+
+    raise SystemExit(asyncio.run(draining_child()))

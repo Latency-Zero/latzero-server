@@ -1,4 +1,5 @@
 import asyncio
+import threading
 
 import pytest
 from websockets.legacy.client import connect as connect_ws
@@ -133,14 +134,56 @@ async def test_failed_snapshot_flush_keeps_directory_owned_until_successful_retr
     server._store.enqueue(PoolState(pool_id="dirty"))
     with pytest.raises(Exception, match="injected storage failure"):
         await server.stop()
+    retained_store = server._store
     assert server._directory_lock is not None
     with pytest.raises((OSError, RuntimeError)):
         DataDirectoryLock(tmp_path).acquire()
+    assert server._store is retained_store
     monkeypatch.setattr(server._store, "_write_file", original)
     await server.stop()
     assert server._directory_lock is None
     lock = DataDirectoryLock(tmp_path).acquire()
     lock.release()
+
+
+@pytest.mark.asyncio
+async def test_restart_refuses_inflight_saver_before_replacing_owned_store(tmp_path, monkeypatch):
+    from latzero_server.models import BufferEntry, PoolState
+
+    server = LatZeroServer(ServerConfig(port=0, websocket_enabled=False, data_dir=tmp_path))
+    await server.start()
+    saver = server._store
+    saver._shutdown_timeout = 0.1
+    entered = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    original = saver._write_file
+
+    def blocked(snapshot):
+        loop.call_soon_threadsafe(entered.set)
+        if not release.wait(3):
+            raise RuntimeError("snapshot barrier was not released")
+        return original(snapshot)
+
+    monkeypatch.setattr(saver, "_write_file", blocked)
+    pool = PoolState(pool_id="owned")
+    pool.buffers["latest"] = BufferEntry(value="old", updated_at=1, updated_by="writer", persistent=True)
+    server._pools[pool.pool_id] = pool
+    saver.enqueue(pool)
+    await asyncio.wait_for(entered.wait(), 1)
+    try:
+        with pytest.raises(Exception):
+            await server.stop()
+        assert server._directory_lock is not None and saver.health["in_flight"]
+        with pytest.raises(RuntimeError, match="Previous snapshot writer"):
+            await server.start()
+        assert server._store is saver
+        assert server._pools["owned"].buffers["latest"].value == "old"
+    finally:
+        release.set()
+        saver._shutdown_timeout = 3
+        await server.stop()
+    assert server._directory_lock is None
 
 
 @pytest.mark.asyncio

@@ -242,6 +242,8 @@ class LatZeroServer:
             return
 
         self.config.validate()
+        if self._storage_started and (self._store.health["running"] or self._store.health["in_flight"]):
+            raise RuntimeError("Previous snapshot writer has not stopped; refusing unsafe restart")
         self._stopping = False
         self._stop_task = None
         ws_port = self.config.websocket_port
@@ -251,12 +253,13 @@ class LatZeroServer:
             if self._pool_routing is None:
                 from .directory_lock import DataDirectoryLock
 
-                if self._directory_lock is None:
+                newly_acquired = self._directory_lock is None
+                if newly_acquired:
                     self._directory_lock = DataDirectoryLock(self.config.data_dir).acquire()
                 # Constructor inspection is read-only state. Re-capture under
                 # ownership before opening listeners so a preconstructed daemon
                 # cannot start from snapshots changed by a previous owner.
-                ownership_changed = (self._directory_owner_token is not None
+                ownership_changed = (newly_acquired and self._directory_owner_token is not None
                                      and self._directory_lock.previous_owner_token != self._directory_owner_token)
                 self._directory_owner_token = self._directory_lock.owner_token
                 if not self._initial_storage_loaded or ownership_changed:
