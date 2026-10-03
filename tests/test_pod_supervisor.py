@@ -209,7 +209,7 @@ async def test_forced_child_termination_reaps_runtime_and_seals_cluster(tmp_path
     assert child.process.returncode != 0
     if child.process.runtime is not None:
         assert not child.process.runtime.alive()
-    with pytest.raises(RuntimeError, match="did not stop cleanly"):
+    with pytest.raises(RuntimeError, match="Pod shutdown failed"):
         await supervisor.stop()
     assert not supervisor._accepting
     assert all(record.process.returncode is not None for record in supervisor.children)

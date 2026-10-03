@@ -211,7 +211,7 @@ class _WindowsProcess:
             self.handle = None
 
 
-def _windows_descendant(pid: int, ancestor: int) -> bool:
+def _windows_parents() -> Dict[int, int]:
     import ctypes
     from ctypes import wintypes
 
@@ -243,6 +243,11 @@ def _windows_descendant(pid: int, ancestor: int) -> bool:
             present = kernel.Process32NextW(snapshot, ctypes.byref(entry))
     finally:
         kernel.CloseHandle(snapshot)
+    return parents
+
+
+def _windows_descendant(pid: int, ancestor: int) -> bool:
+    parents = _windows_parents()
     for _ in range(16):
         if pid == ancestor:
             return True
@@ -258,6 +263,7 @@ class _PodProcess:
     def __init__(self, process: Any):
         self.launcher = process
         self.runtime = None
+        self._extra_runtimes = {}
         self._pid = process.pid
         self._runtime_code = None
 
@@ -267,6 +273,8 @@ class _PodProcess:
 
     @property
     def returncode(self) -> Optional[int]:
+        if any(handle.alive() for handle in self._extra_runtimes.values()):
+            return None
         if self._runtime_code is not None:
             return (self._runtime_code or self.launcher.returncode) if self.launcher.returncode is not None else None
         if self.runtime is not None:
@@ -281,28 +289,64 @@ class _PodProcess:
             raise ValueError("Invalid pod runtime PID")
         if pid != self.launcher.pid and (os.name != "nt" or not _windows_descendant(pid, self.launcher.pid)):
             raise ValueError("Pod runtime is not a child of its launcher")
-        if os.name == "nt" and self.runtime is None:
-            self.runtime = _WindowsProcess(pid, terminate=True)
+        if os.name == "nt" and (self.runtime is None or self.runtime.pid != pid):
+            if self.runtime is not None:
+                self._extra_runtimes[self.runtime.pid] = self.runtime
+            self.runtime = self._extra_runtimes.pop(pid, None) or _WindowsProcess(pid, terminate=True)
         self._pid = pid
+
+    def discover_runtimes(self) -> None:
+        if os.name != "nt":
+            return
+        parents = _windows_parents()
+        descendants = {self.launcher.pid}
+        for _ in range(16):
+            found = {pid for pid, parent in parents.items() if parent in descendants}
+            if found.issubset(descendants):
+                break
+            descendants.update(found)
+        descendants.discard(self.launcher.pid)
+        for pid in descendants:
+            if self.runtime is not None and pid == self.runtime.pid or pid in self._extra_runtimes:
+                continue
+            try:
+                handle = _WindowsProcess(pid, terminate=True)
+            except OSError:
+                if pid in _windows_parents():
+                    raise
+                continue
+            if self.runtime is None:
+                self.runtime = handle
+                self._pid = pid
+            else:
+                self._extra_runtimes[pid] = handle
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.launcher, name)
 
     async def wait(self) -> int:
         await self.launcher.wait()
-        while self.runtime is not None and self.runtime.alive():
+        self.discover_runtimes()
+        while (self.runtime is not None and self.runtime.alive()
+               or any(handle.alive() for handle in self._extra_runtimes.values())):
             await asyncio.sleep(0.05)
         return self.returncode
 
     def terminate(self) -> None:
+        self.discover_runtimes()
         if self.runtime is not None:
             self.runtime.terminate()
+        for handle in self._extra_runtimes.values():
+            handle.terminate()
         if self.launcher.returncode is None:
             self.launcher.terminate()
 
     def kill(self) -> None:
+        self.discover_runtimes()
         if self.runtime is not None:
             self.runtime.terminate()
+        for handle in self._extra_runtimes.values():
+            handle.terminate()
         if self.launcher.returncode is None:
             self.launcher.kill()
 
@@ -311,6 +355,10 @@ class _PodProcess:
             self._runtime_code = self.runtime.returncode
             self.runtime.close()
             self.runtime = None
+        if self.returncode is not None:
+            for handle in self._extra_runtimes.values():
+                handle.close()
+            self._extra_runtimes.clear()
 
 
 class PodSupervisor:
@@ -347,6 +395,7 @@ class PodSupervisor:
         self._connection_count = 0
         self._readers = set()
         self._creations = set()
+        self._spawns = set()
         self._metrics = {"received": 0, "redirects": 0, "overload_rejections": 0}
 
     @property
@@ -362,7 +411,12 @@ class PodSupervisor:
         async with self._lifecycle_lock:
             if self._started and self._accepting:
                 return
-            if self._creations or any(child.process is not None and child.process.returncode is None for child in self.children):
+            if self._stop_task is not None and not self._stop_task.done():
+                raise RuntimeError("Previous pods are still stopping")
+            if self._spawns or self._creations or self._directory_lock is not None or any(
+                child.process is not None and (child.process.returncode is None or not child._stdout_eof or not child._stderr_eof)
+                for child in self.children
+            ):
                 raise RuntimeError("Previous pods have not been reaped")
             if self._readers or self._sessions:
                 raise RuntimeError("Previous router sessions are still closing")
@@ -378,9 +432,9 @@ class PodSupervisor:
             self._closed = asyncio.Event()
             self.cluster_id = uuid.uuid4().hex
             self.children = []
-            self._directory_lock = DataDirectoryLock(self.config.data_dir).acquire()
             deadline = asyncio.get_running_loop().time() + self.startup_timeout
             try:
+                self._directory_lock = DataDirectoryLock(self.config.data_dir).acquire()
                 await asyncio.wait_for(self._bind_router(), self._remaining(deadline))
                 loop = asyncio.get_running_loop()
                 for index in range(self.pods):
@@ -390,8 +444,17 @@ class PodSupervisor:
                     for future in (child._ready, child._configured):
                         future.add_done_callback(lambda done: None if done.cancelled() else done.exception())
                     self.children.append(child)
-                await asyncio.wait_for(asyncio.gather(*(self._spawn(child, child_config, deadline) for child in self.children)),
-                                       self._remaining(deadline))
+                for child in self.children:
+                    task = asyncio.create_task(self._spawn(child, child_config, deadline), name="latzero-pod-spawn-{}".format(child.index))
+                    self._spawns.add(task)
+
+                    def spawn_done(done):
+                        self._spawns.discard(done)
+                        if not done.cancelled():
+                            done.exception()
+
+                    task.add_done_callback(spawn_done)
+                await asyncio.wait_for(asyncio.gather(*list(self._spawns)), self._remaining(deadline))
                 await asyncio.wait_for(asyncio.gather(*(asyncio.shield(child._ready) for child in self.children)),
                                        self._remaining(deadline))
                 endpoints = [{"host": _HOST, "port": child.port, "ws_port": child.ws_port} for child in self.children]
@@ -415,6 +478,11 @@ class PodSupervisor:
                 self._health_task = asyncio.create_task(self._health_loop(), name="latzero-pod-health")
             except BaseException as exc:
                 self._health_error = "Pod startup failed: {}".format(exc)[:2048]
+                self._stopping = True
+                for task in list(self._spawns):
+                    task.cancel()
+                if self._spawns:
+                    await asyncio.wait(list(self._spawns), timeout=1.0)
                 try:
                     await self._stop()
                 except Exception as cleanup_error:
@@ -455,6 +523,8 @@ class PodSupervisor:
             self.ws_port = self._websocket_server.sockets[0].getsockname()[1]
 
     async def _spawn(self, child: PodChild, config: dict, deadline: float) -> None:
+        if self._stopping:
+            return
         command = [sys.executable, "--pod-child"] if getattr(sys, "frozen", False) else [
             sys.executable, "-m", "latzero_server.pods", "--child",
         ]
@@ -504,6 +574,8 @@ class PodSupervisor:
                 raw = await child.process.stdout.readline()
                 if not raw:
                     child._stdout_eof = True
+                    if not self._stopping:
+                        self._child_failure(child, "Pod {} control output closed unexpectedly".format(child.index))
                     return
                 if len(raw) > _CONTROL_LIMIT or not raw.endswith(b"\n"):
                     raise ValueError("Invalid or oversized pod control output")
@@ -526,7 +598,7 @@ class PodSupervisor:
                     child._configured.set_result(message)
                 elif message.get("stopped") is True and not child._stopped.done():
                     child._stopped.set_result(message)
-                elif isinstance(message.get("stats"), dict) and child._stats_pending:
+                elif isinstance(message.get("stats"), dict) and child._configured.done():
                     child.stats = message["stats"]
                     child._stats_pending = False
                     child._stats_requested = None
@@ -575,7 +647,10 @@ class PodSupervisor:
         if self._stopping:
             return
         self._health_error = self._health_error or child.error
-        self._seal_ingress()
+        try:
+            self._seal_ingress()
+        except Exception as exc:
+            self._health_error += "; router seal failed: {}".format(exc)[:512]
         if self._started and (self._failure_task is None or self._failure_task.done()):
             self._failure_task = asyncio.create_task(self.stop(), name="latzero-pod-failure-stop")
             self._failure_task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
@@ -843,7 +918,7 @@ class PodSupervisor:
                 if not task.cancelled() and task.exception() is not None:
                     errors.append(str(task.exception()))
             self._health_task = None
-        reaped = not self._creations and all(child.process is None or child.process.returncode is not None
+        reaped = not self._spawns and not self._creations and all(child.process is None or child.process.returncode is not None
                                            and child._stdout_eof and child._stderr_eof for child in self.children)
         if reaped and self._directory_lock is not None:
             try:

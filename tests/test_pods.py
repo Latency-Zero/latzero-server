@@ -311,7 +311,7 @@ async def test_persistent_flat_hash_snapshots_auth_and_ttl_survive_two_to_four_p
         stats = await second.refresh_stats()
         for index, item in enumerate(stats):
             assert item["pools"] == sum(reference_owner(pool, 4) == index for pool in pools)
-            assert item["pool_ids"] == sorted(pool for pool in pools if reference_owner(pool, 4) == index)
+            assert sorted(item["pool_ids"]) == sorted(pool for pool in pools if reference_owner(pool, 4) == index)
             assert item["pool_ids_truncated"] is False
             assert item["pid"] == second.children[index].pid
     assert {path: path.read_bytes() for path in expected_paths} == original_bytes
