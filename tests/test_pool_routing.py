@@ -196,3 +196,44 @@ def test_snapshot_load_retains_only_exact_owned_pool_before_ttl_dirty_capture(tm
     assert set(server._pools["owned"].buffers) == {"latest"}
     assert set(server._store._dirty) == {"owned"}
     assert server._store._dirty["owned"].pool.buffers["latest"].value == "owned"
+
+
+@pytest.mark.asyncio
+async def test_restart_after_another_owner_uses_latest_disk_not_stale_memory(tmp_path):
+    first = LatZeroServer(ServerConfig(port=0, websocket_enabled=False, data_dir=tmp_path))
+    second = LatZeroServer(ServerConfig(port=0, websocket_enabled=False, data_dir=tmp_path))
+    await first.start()
+    one = await open_client(first, "tcp")
+    await one.join("one", "owned")
+    await one.request("set_buffer", {"key": "latest", "value": 1, "persistent": True})
+    await one.request("set_buffer", {"key": "ephemeral", "value": "first-owner"})
+    await one.close()
+    await first.stop()
+    await second.start()
+    two = await open_client(second, "tcp")
+    await two.join("two", "owned")
+    await two.request("set_buffer", {"key": "latest", "value": 2, "persistent": True})
+    await two.close()
+    await second.stop()
+    await first.start()
+    try:
+        assert first._pools["owned"].buffers["latest"].value == 2
+        assert "ephemeral" not in first._pools["owned"].buffers
+    finally:
+        await first.stop()
+
+
+@pytest.mark.asyncio
+async def test_same_owner_restart_retains_existing_ephemeral_behavior(tmp_path):
+    server = LatZeroServer(ServerConfig(port=0, websocket_enabled=False, data_dir=tmp_path))
+    await server.start()
+    client = await open_client(server, "tcp")
+    await client.join("one", "owned")
+    await client.request("set_buffer", {"key": "ephemeral", "value": 42})
+    await client.close()
+    await server.stop()
+    await server.start()
+    try:
+        assert server._pools["owned"].buffers["ephemeral"].value == 42
+    finally:
+        await server.stop()
