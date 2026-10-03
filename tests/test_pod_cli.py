@@ -68,3 +68,11 @@ def test_frozen_hidden_child_dispatch_does_not_enter_normal_cli(monkeypatch):
     monkeypatch.setattr(pods, "child_main", lambda: 17)
     monkeypatch.setattr(cli, "_run", lambda args: pytest.fail("Child dispatch must not construct the public supervisor"))
     assert cli.main(["--pod-child"]) == 17
+
+
+@pytest.mark.asyncio
+async def test_pod_cli_rejects_remote_bind_before_start(tmp_path):
+    args = cli.build_parser().parse_args(["--pods", "2", "--host", "0.0.0.0", "--data-dir", str(tmp_path)])
+    with pytest.raises(ValueError, match="127.0.0.1"):
+        await cli._run(args)
+    assert not (tmp_path / ".latzero.lock").exists()

@@ -6,11 +6,9 @@ import json
 import os
 import signal
 import socket
-import time
-from contextlib import suppress
 
 import pytest
-from websockets.exceptions import ConnectionClosed, InvalidStatusCode
+from websockets.exceptions import InvalidStatusCode
 
 from latzero_server.config import ServerConfig
 from latzero_server.server import LatZeroServer
@@ -83,6 +81,14 @@ async def test_same_pool_public_tcp_and_ws_connections_have_one_real_owner(tmp_p
         assert peers[0].writer.get_extra_info("sockname") != peers[2].writer.get_extra_info("sockname")
         assert len({child.pid for child in cluster.children}) == 4
         assert all(child.pid != os.getpid() and child.process.returncode is None for child in cluster.children)
+        stats = await cluster.refresh_stats()
+        for index, item in enumerate(stats):
+            assert item["pid"] == cluster.children[index].pid and item["pod_index"] == index
+            assert item["connections"] == (4 if index == owner.index else 0)
+            assert item["pools"] == (1 if index == owner.index else 0)
+            assert item["health_error"] is None
+            assert item["persistence"]["healthy"] is True and item["persistence"]["running"] is True
+            assert isinstance(item["metrics"]["received"], int)
 
 
 @pytest.mark.asyncio
@@ -127,6 +133,12 @@ async def test_four_owner_pools_isolate_membership_buffers_subscriptions_and_rou
             await recipient.hello()
             assert [message["payload"]["entry"]["value"] for message in recipient.received
                     if message["type"] == "buffer_update"] == [value]
+        stats = await cluster.refresh_stats()
+        for index, item in enumerate(stats):
+            assert item["pools"] == 1 and item["connections"] == 3
+            assert item["metrics"]["accepted_calls"] == item["metrics"]["completed_calls"] == 2
+            assert item["health_error"] is None and item["persistence"]["healthy"] is True
+            assert item["pid"] == cluster.children[index].pid
 
 
 @pytest.mark.asyncio
@@ -225,6 +237,11 @@ async def test_cross_owner_switch_cleans_old_membership_subscriptions_processes_
         assert (await old_peer.receive("buffer_update"))["pool"] == old_pool
         await mover.hello()
         assert [message["pool"] for message in mover.received if message["type"] == "buffer_update"] == [new_pool]
+        stats = await cluster.refresh_stats()
+        assert stats[0]["connections"] == 1 and stats[1]["connections"] == 2
+        assert stats[0]["metrics"]["accepted_calls"] == 2
+        assert stats[0]["metrics"]["completed_calls"] == stats[0]["metrics"]["failed_calls"] == 1
+        assert stats[1]["metrics"]["accepted_calls"] == stats[1]["metrics"]["completed_calls"] == 1
 
 
 @pytest.mark.asyncio
@@ -276,6 +293,10 @@ async def test_persistent_flat_hash_snapshots_auth_and_ttl_survive_two_to_four_p
             assert (await peer.ack("list_clients"))["payload"]["clients"] == [peer.client_id]
             assert (await peer.ack("list_processes"))["payload"]["processes"] == {}
             await denied.close()
+        stats = await second.refresh_stats()
+        for index, item in enumerate(stats):
+            assert item["pools"] == sum(reference_owner(pool, 4) == index for pool in pools)
+            assert item["pid"] == second.children[index].pid
     assert {path: path.read_bytes() for path in expected_paths} == original_bytes
     assert set(tmp_path.glob("*.json")) == expected_paths
 
@@ -342,7 +363,7 @@ async def test_classic_daemon_and_second_supervisor_cannot_write_live_root(tmp_p
             assert not classic._storage_started and not classic._sessions
             with pytest.raises((OSError, RuntimeError)):
                 await second.start()
-            assert all(child.process.returncode is not None for child in second.child_records)
+            assert all(child.process is None or child.process.returncode is not None for child in second.child_records)
             assert (await get_value(peer, "persisted"))["entry"]["value"] == "owner"
             await peer.ack("set_buffer", {"key": "persisted", "value": "still-owner", "persistent": True})
         finally:
@@ -355,7 +376,7 @@ async def test_classic_daemon_and_second_supervisor_cannot_write_live_root(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_public_ws_bind_failure_rolls_back_and_reaps_all_started_pods(tmp_path):
+async def test_public_ws_bind_failure_closes_partial_router_and_releases_root(tmp_path):
     blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     blocker.bind(("127.0.0.1", 0))
     blocker.listen(1)
@@ -364,7 +385,7 @@ async def test_public_ws_bind_failure_rolls_back_and_reaps_all_started_pods(tmp_
         with pytest.raises((OSError, RuntimeError)):
             await cluster.start()
         children = list(cluster.children)
-        assert all(child.process.returncode is not None for child in children)
+        assert all(child.process is None or child.process.returncode is not None for child in children)
         await assert_listener_closed(cluster.tcp_port)
         for child in children:
             await assert_listener_closed(child.port)
@@ -375,6 +396,41 @@ async def test_public_ws_bind_failure_rolls_back_and_reaps_all_started_pods(tmp_
     async with pod_cluster(tmp_path, 2) as reopened:
         peer, _ = await reopened.join("rollback-recovered", "rollback-pool")
         assert (await peer.ack("list_clients"))["payload"]["clients"] == ["rollback-recovered"]
+
+
+@pytest.mark.asyncio
+async def test_partial_child_start_failure_reaps_started_processes_and_closes_router(tmp_path, monkeypatch):
+    cluster = PodCluster(tmp_path, 4)
+    original_spawn = cluster.supervisor._spawn
+    two_ready = asyncio.Event()
+    started = []
+
+    async def partial_spawn(child, config, deadline):
+        if child.index >= 2:
+            await asyncio.wait_for(two_ready.wait(), 30)
+            raise OSError("injected third pod bind failure after two real readiness frames")
+        await original_spawn(child, config, deadline)
+        await asyncio.wait_for(asyncio.shield(child._ready), 30)
+        started.append(child)
+        if len(started) == 2:
+            two_ready.set()
+
+    monkeypatch.setattr(cluster.supervisor, "_spawn", partial_spawn)
+    try:
+        with pytest.raises(OSError, match="third pod bind failure"):
+            await cluster.start()
+        assert len(started) == 2 and len({child.pid for child in started}) == 2
+        assert all(child.process.returncode is not None for child in started)
+        for child in started:
+            await assert_listener_closed(child.port)
+            await assert_listener_closed(child.ws_port)
+        await assert_listener_closed(cluster.tcp_port)
+        await assert_listener_closed(cluster.ws_port)
+    finally:
+        await cluster.close()
+    async with pod_cluster(tmp_path, 2) as recovered:
+        peer, _ = await recovered.join("partial-start-recovered", "recovered-pool")
+        assert (await peer.ack("list_clients"))["payload"]["clients"] == [peer.client_id]
 
 
 @pytest.mark.asyncio
@@ -393,6 +449,7 @@ async def test_killed_owner_stops_serving_all_pods_without_remapping(tmp_path):
         serve = asyncio.create_task(cluster.supervisor.serve_forever())
         await peers[3].hello()
         failed = cluster.children[1]
+        cluster.expect_shutdown_error = True
         os.kill(failed.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
         await asyncio.wait_for(failed.process.wait(), 15)
         assert failed.process.returncode != 0
@@ -430,7 +487,7 @@ async def test_router_control_errors_are_correlated_and_do_not_mutate_pool(tmp_p
             assert reply["type"] == "error", reply
             assert isinstance(reply["payload"].get("code"), str) and reply["payload"]["code"]
         hello = await peer.hello()
-        assert hello["payload"]["capabilities"] == ["pool_redirect_v1"]
+        assert hello["payload"]["server"] == "latzero-server"
         peer, _ = await cluster.join("valid-after-controls", "control-pool", transport, peer=peer)
         assert (await get_value(peer, "must-not-write"))["exists"] is False
         assert (await peer.ack("list_clients"))["payload"]["clients"] == ["valid-after-controls"]
@@ -448,7 +505,7 @@ async def test_router_tcp_split_coalesced_frames_and_pipelined_effect_after_redi
         await asyncio.wait_for(peer.writer.drain(), 3)
         peer.writer.write(encoded[13:])
         await asyncio.wait_for(peer.writer.drain(), 3)
-        assert (await peer.receive("ack", "coalesced-hello"))["payload"]["capabilities"] == ["pool_redirect_v1"]
+        assert (await peer.receive("ack", "coalesced-hello"))["payload"]["server"] == "latzero-server"
         assert (await peer.receive("ack", "split-hello"))["request_id"] == "split-hello"
         pool = "pipeline-redirect"
         join = peer.message("join_pool", {"client_id": "pipelined", "pool": pool}, "pipeline-join")
@@ -494,8 +551,16 @@ async def test_router_malformed_binary_and_frame_limits(tmp_path, transport):
 
 
 @pytest.mark.asyncio
-async def test_router_connection_limit_includes_pending_ws_handshakes(tmp_path):
+async def test_router_connection_limit_includes_pending_ws_handshakes(tmp_path, monkeypatch):
     async with pod_cluster(tmp_path, 2, max_connections=1) as cluster:
+        router_closed = asyncio.Event()
+        finish_session = cluster.supervisor._finish_session
+
+        async def observed_close(session):
+            await finish_session(session)
+            router_closed.set()
+
+        monkeypatch.setattr(cluster.supervisor, "_finish_session", observed_close)
         admitted = await cluster.open()
         await admitted.hello()
         rejected = await cluster.open()
@@ -510,8 +575,17 @@ async def test_router_connection_limit_includes_pending_ws_handshakes(tmp_path):
         reply = await admitted.request("join_pool", {"client_id": "slot-release", "pool": pool}, "slot-redirect")
         cluster.assert_redirect(reply, "slot-redirect", "slot-release", pool)
         await admitted.expect_closed()
-        await asyncio.sleep(0)
+        await asyncio.wait_for(router_closed.wait(), 3)
+        handshake_admitted = asyncio.Event()
+
+        class ObservedHandshakes(dict):
+            def __setitem__(self, key, value):
+                super().__setitem__(key, value)
+                handshake_admitted.set()
+
+        monkeypatch.setattr(cluster.supervisor, "_pending_websockets", ObservedHandshakes())
         handshake = await cluster.open("tcp", port=cluster.ws_port)
+        await asyncio.wait_for(handshake_admitted.wait(), 3)
         rejected = await cluster.open()
         assert (await rejected.receive("error"))["payload"]["code"] == "server_busy"
         await rejected.expect_closed()
@@ -551,3 +625,15 @@ async def test_stopping_supervisor_reaps_children_and_closes_tcp_ws_ports(tmp_pa
         await asyncio.wait_for(cluster.supervisor.stop(), 5)
     finally:
         await cluster.close()
+
+
+@pytest.mark.asyncio
+async def test_disabled_websocket_redirect_metadata_uses_null_ports(tmp_path):
+    async with pod_cluster(tmp_path, 2, websocket_enabled=False) as cluster:
+        assert cluster.ws_port is None and all(child.ws_port is None for child in cluster.children)
+        peer, _ = await cluster.join("tcp-only", "tcp-only-pool")
+        assert len(peer.redirects) == 1
+        assert peer.redirects[0]["payload"]["ws_port"] is None
+        assert peer.redirects[0]["payload"]["router_ws_port"] is None
+        await peer.ack("set_buffer", {"key": "value", "value": "tcp"})
+        assert (await get_value(peer, "value"))["entry"]["value"] == "tcp"

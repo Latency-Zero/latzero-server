@@ -9,6 +9,8 @@ from conftest import RawClient
 
 
 class OtherOwner:
+    configured = True
+
     def owns(self, pool):
         return pool == "owned"
 
@@ -157,3 +159,40 @@ async def test_single_daemon_lock_blocks_second_daemon_without_altering_first(tm
         await first.stop()
     await second.start()
     await second.stop()
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_pod_never_accepts_internal_clients(tmp_path):
+    from latzero_server.pods import PoolRouting
+
+    server = LatZeroServer(ServerConfig(port=0, websocket_enabled=False, data_dir=tmp_path),
+                           pool_routing=PoolRouting(0, 2))
+    await server.start()
+    try:
+        client = await open_client(server, "tcp")
+        try:
+            error = await client.receive("error")
+            assert error["payload"]["code"] == "server_busy"
+            assert await asyncio.wait_for(client.reader.read(), 2) == b""
+            assert not server._pools
+        finally:
+            await client.close()
+    finally:
+        await server.stop()
+
+
+def test_snapshot_load_retains_only_exact_owned_pool_before_ttl_dirty_capture(tmp_path):
+    from latzero_server.models import BufferEntry, PoolState
+    from latzero_server.persistence import SnapshotStore
+
+    store = SnapshotStore(tmp_path)
+    for pool_id in ("owned", "elsewhere"):
+        pool = PoolState(pool_id=pool_id)
+        pool.buffers["expired"] = BufferEntry(value="stale", updated_at=1, updated_by="old", ttl=1, persistent=True)
+        pool.buffers["latest"] = BufferEntry(value=pool_id, updated_at=1, updated_by="old", persistent=True)
+        store.save_pool(pool)
+    server = LatZeroServer(ServerConfig(data_dir=tmp_path), pool_routing=OtherOwner())
+    assert set(server._pools) == {"owned"}
+    assert set(server._pools["owned"].buffers) == {"latest"}
+    assert set(server._store._dirty) == {"owned"}
+    assert server._store._dirty["owned"].pool.buffers["latest"].value == "owned"

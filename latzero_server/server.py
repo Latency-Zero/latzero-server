@@ -270,7 +270,7 @@ class LatZeroServer:
             await self._worker_pool.start()
             self._fanout_ready = asyncio.Event()
             self._fanout_task = self._track(self._fanout_loop(), "latzero-fanout")
-            self._accepting = True
+            self._accepting = self._pool_routing is None or bool(getattr(self._pool_routing, "configured", False))
             self._tcp_server = await asyncio.start_server(
                 self._handle_connection, host=self.config.host, port=self.config.port,
                 limit=self.config.max_frame_bytes + 1,

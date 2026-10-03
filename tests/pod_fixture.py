@@ -50,6 +50,7 @@ class PodPeer:
         self.sent = []
         self.redirects = []
         self.visited = []
+        self.join_messages = []
         self.closed = False
 
     def message(self, kind, payload=None, request_id=None, pool=None, client_id=None):
@@ -154,6 +155,32 @@ class PodCluster:
         self.count = pods
         self.clients = []
         self.child_records = []
+        self.stats_waiters = {}
+        self.expect_shutdown_error = False
+        spawn = self.supervisor._spawn
+
+        async def observed_spawn(child, config, deadline):
+            await spawn(child, config, deadline)
+            readline = child.process.stdout.readline
+
+            async def observed_readline():
+                raw = await readline()
+                if raw:
+                    message = json.loads(raw)
+                    waiter = self.stats_waiters.get(child.index)
+                    if isinstance(message.get("stats"), dict) and waiter is not None:
+                        # Observe real control output; let the supervisor commit
+                        # it before releasing the test's snapshot barrier.
+                        def observed():
+                            if not waiter.done():
+                                waiter.set_result(message["stats"])
+
+                        asyncio.get_running_loop().call_soon(observed)
+                return raw
+
+            child.process.stdout.readline = observed_readline
+
+        self.supervisor._spawn = observed_spawn
 
     @property
     def tcp_port(self):
@@ -169,6 +196,25 @@ class PodCluster:
 
     def snapshot(self):
         return self.supervisor.get_dashboard_snapshot()
+
+    async def refresh_stats(self):
+        async def refresh(child):
+            if child._stats_pending:
+                waiter = asyncio.get_running_loop().create_future()
+                self.stats_waiters[child.index] = waiter
+                await asyncio.wait_for(waiter, 5)
+            waiter = asyncio.get_running_loop().create_future()
+            self.stats_waiters[child.index] = waiter
+            child._stats_pending = True
+            try:
+                await self.supervisor._send_control(child, {"operation": "stats"})
+                result = await asyncio.wait_for(waiter, 5)
+                assert result == child.stats
+                return result
+            finally:
+                self.stats_waiters.pop(child.index, None)
+
+        return await asyncio.gather(*(refresh(child) for child in self.children))
 
     async def start(self):
         try:
@@ -226,7 +272,7 @@ class PodCluster:
                 assert peer.client_id == client_id
             else:
                 hello = await peer.hello()
-                assert "pool_redirect_v1" in hello["payload"]["capabilities"]
+                assert hello["payload"]["server"] == "latzero-server"
             kind = operation if hop == 0 else "join_pool"
             message = peer.message(kind, {"client_id": client_id, "pool": pool, "auth_token": auth_token})
             join_messages.append(message)
@@ -255,8 +301,13 @@ class PodCluster:
 
     async def close(self):
         results = await asyncio.gather(*(peer.close() for peer in self.clients), return_exceptions=True)
-        await asyncio.wait_for(self.supervisor.stop(), 40)
-        assert all(child.process.returncode is not None for child in self.child_records), "Supervisor did not reap every child"
+        try:
+            await asyncio.wait_for(self.supervisor.stop(), 40)
+        except RuntimeError:
+            if not self.expect_shutdown_error:
+                raise
+            assert self.snapshot()["healthy"] is False
+        assert all(child.process is None or child.process.returncode is not None for child in self.child_records), "Supervisor did not reap every child"
         for result in results:
             if isinstance(result, BaseException):
                 raise result

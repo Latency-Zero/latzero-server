@@ -3,6 +3,7 @@
 import errno
 import os
 import threading
+import uuid
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -31,6 +32,12 @@ def _lock_range(fd: int, offset: int, length: int, acquire: bool) -> None:
         fcntl.lockf(fd, flags, length, offset, os.SEEK_SET)
 
 
+def _release_scan(fd: int, count: int) -> None:
+    # Windows requires unlock boundaries to match each LockFile range.
+    for offset in range(count, 0, -1):
+        _lock_range(fd, offset, 1, False)
+
+
 class DataDirectoryLock:
     """Lock byte zero for a parent/classic daemon, or byte ``slot + 1``.
 
@@ -49,6 +56,8 @@ class DataDirectoryLock:
         self.slot = slot
         self._entry = None
         self._pid = None
+        self.previous_owner_token = None
+        self.owner_token = None
 
     @property
     def acquired(self) -> bool:
@@ -104,15 +113,23 @@ class DataDirectoryLock:
                             raise OSError(errno.EBUSY, "A pod writer is still active")
                         _lock_range(entry["fd"], child_offset, 1, True)
                         scanned += 1
-                    _lock_range(entry["fd"], 1, scanned, False)
+                    _release_scan(entry["fd"], scanned)
                     scanned = 0
+                    os.lseek(entry["fd"], _MAX_SLOTS + 1, os.SEEK_SET)
+                    previous = os.read(entry["fd"], 32)
+                    self.previous_owner_token = previous.decode("ascii") if len(previous) == 32 and all(
+                        value in b"0123456789abcdef" for value in previous) else None
+                    self.owner_token = uuid.uuid4().hex
+                    os.lseek(entry["fd"], _MAX_SLOTS + 1, os.SEEK_SET)
+                    if os.write(entry["fd"], self.owner_token.encode("ascii")) != 32:
+                        raise OSError("Incomplete root ownership marker write")
                 entry["held"].add(offset)
                 self._entry = entry
                 self._pid = os.getpid()
                 return self
             except OSError as exc:
                 if scanned:
-                    _lock_range(entry["fd"], 1, scanned, False)
+                    _release_scan(entry["fd"], scanned)
                 if locked:
                     _lock_range(entry["fd"], offset, 1, False)
                 self._discard_unused(identity, entry)
@@ -121,7 +138,7 @@ class DataDirectoryLock:
                 ) from exc
             except BaseException:
                 if scanned:
-                    _lock_range(entry["fd"], 1, scanned, False)
+                    _release_scan(entry["fd"], scanned)
                 if locked:
                     _lock_range(entry["fd"], offset, 1, False)
                 self._discard_unused(identity, entry)

@@ -80,6 +80,10 @@ class PoolRouting:
     def pod_count(self) -> int:
         return self._pod_count
 
+    @property
+    def configured(self) -> bool:
+        return self._table is not None
+
     def owns(self, pool: str) -> bool:
         return pool_owner(pool, self.pod_count) == self.pod_index
 
@@ -131,8 +135,12 @@ class PodChild:
     _stdout_task: Any = field(default=None, repr=False)
     _stderr_task: Any = field(default=None, repr=False)
     _exit_task: Any = field(default=None, repr=False)
+    _creation_task: Any = field(default=None, repr=False)
     _control_lock: Any = field(default=None, repr=False)
     _stats_pending: bool = field(default=False, repr=False)
+    _stats_requested: Any = field(default=None, repr=False)
+    _stdout_eof: bool = field(default=False, repr=False)
+    _stderr_eof: bool = field(default=False, repr=False)
 
 
 @dataclass
@@ -152,6 +160,155 @@ def _control_frame(message: dict) -> bytes:
     if len(frame) > _CONTROL_LIMIT:
         raise ValueError("Pod control frame exceeds 64 KiB")
     return frame
+
+
+class _WindowsProcess:
+    def __init__(self, pid: int, terminate: bool = False):
+        import ctypes
+        from ctypes import wintypes
+
+        self.pid = pid
+        self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        self.kernel.OpenProcess.restype = wintypes.HANDLE
+        self.kernel.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        self.kernel.WaitForSingleObject.restype = wintypes.DWORD
+        self.kernel.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        self.kernel.GetExitCodeProcess.restype = wintypes.BOOL
+        self.kernel.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
+        self.kernel.TerminateProcess.restype = wintypes.BOOL
+        self.kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        self.kernel.CloseHandle.restype = wintypes.BOOL
+        self.handle = self.kernel.OpenProcess(0x00100000 | 0x1000 | int(terminate), False, pid)
+        if not self.handle:
+            raise OSError(ctypes.get_last_error(), "Cannot observe process {}".format(pid))
+
+    def alive(self) -> bool:
+        result = self.kernel.WaitForSingleObject(self.handle, 0)
+        if result not in (0, 258):
+            raise OSError("Cannot determine process liveness")
+        return result == 258
+
+    @property
+    def returncode(self) -> Optional[int]:
+        if self.alive():
+            return None
+        from ctypes import byref
+        from ctypes.wintypes import DWORD
+
+        code = DWORD()
+        if not self.kernel.GetExitCodeProcess(self.handle, byref(code)):
+            raise OSError("Cannot determine process exit code")
+        return int(code.value)
+
+    def terminate(self) -> None:
+        if self.alive() and not self.kernel.TerminateProcess(self.handle, 1):
+            raise OSError("Cannot terminate process {}".format(self.pid))
+
+    def close(self) -> None:
+        if self.handle is not None:
+            self.kernel.CloseHandle(self.handle)
+            self.handle = None
+
+
+def _windows_descendant(pid: int, ancestor: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    class ProcessEntry(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("pid", wintypes.DWORD),
+                    ("heap", ctypes.c_size_t), ("module", wintypes.DWORD), ("threads", wintypes.DWORD),
+                    ("parent", wintypes.DWORD), ("priority", wintypes.LONG), ("flags", wintypes.DWORD),
+                    ("exe", wintypes.WCHAR * 260)]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+    kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    for name in ("Process32FirstW", "Process32NextW"):
+        function = getattr(kernel, name)
+        function.argtypes = (wintypes.HANDLE, ctypes.POINTER(ProcessEntry))
+        function.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel.CloseHandle.restype = wintypes.BOOL
+    snapshot = kernel.CreateToolhelp32Snapshot(2, 0)
+    if snapshot == wintypes.HANDLE(-1).value:
+        raise OSError("Cannot inspect pod process ancestry")
+    parents = {}
+    try:
+        entry = ProcessEntry()
+        entry.dwSize = ctypes.sizeof(entry)
+        present = kernel.Process32FirstW(snapshot, ctypes.byref(entry))
+        while present and len(parents) < 65536:
+            parents[int(entry.pid)] = int(entry.parent)
+            present = kernel.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel.CloseHandle(snapshot)
+    for _ in range(16):
+        if pid == ancestor:
+            return True
+        pid = parents.get(pid)
+        if pid is None:
+            break
+    return False
+
+
+class _PodProcess:
+    """Keep the venv launcher and actual Windows runtime as one child lease."""
+
+    def __init__(self, process: Any):
+        self.launcher = process
+        self.runtime = None
+        self._runtime_code = None
+
+    @property
+    def pid(self) -> int:
+        return self.runtime.pid if self.runtime is not None else self.launcher.pid
+
+    @property
+    def returncode(self) -> Optional[int]:
+        if self._runtime_code is not None:
+            return self._runtime_code or self.launcher.returncode if self.launcher.returncode is not None else None
+        if self.runtime is not None:
+            code = self.runtime.returncode
+            if code is None or self.launcher.returncode is None:
+                return None
+            return code or self.launcher.returncode
+        return self.launcher.returncode
+
+    def attach_runtime(self, pid: int) -> None:
+        if type(pid) is not int or not 0 < pid <= 0xFFFFFFFF:
+            raise ValueError("Invalid pod runtime PID")
+        if pid != self.launcher.pid and (os.name != "nt" or not _windows_descendant(pid, self.launcher.pid)):
+            raise ValueError("Pod runtime is not a child of its launcher")
+        if os.name == "nt" and self.runtime is None:
+            self.runtime = _WindowsProcess(pid, terminate=True)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.launcher, name)
+
+    async def wait(self) -> int:
+        await self.launcher.wait()
+        while self.runtime is not None and self.runtime.alive():
+            await asyncio.sleep(0.05)
+        return self.returncode
+
+    def terminate(self) -> None:
+        if self.runtime is not None:
+            self.runtime.terminate()
+        if self.launcher.returncode is None:
+            self.launcher.terminate()
+
+    def kill(self) -> None:
+        if self.runtime is not None:
+            self.runtime.terminate()
+        if self.launcher.returncode is None:
+            self.launcher.kill()
+
+    def release_handle(self) -> None:
+        if self.runtime is not None and self.returncode is not None:
+            self._runtime_code = self.runtime.returncode
+            self.runtime.close()
+            self.runtime = None
 
 
 class PodSupervisor:
@@ -187,6 +344,7 @@ class PodSupervisor:
         self._pending_websockets: Dict[int, Any] = {}
         self._connection_count = 0
         self._readers = set()
+        self._creations = set()
         self._metrics = {"received": 0, "redirects": 0, "overload_rejections": 0}
 
     @property
@@ -202,7 +360,7 @@ class PodSupervisor:
         async with self._lifecycle_lock:
             if self._started and self._accepting:
                 return
-            if any(child.process is not None and child.process.returncode is None for child in self.children):
+            if self._creations or any(child.process is not None and child.process.returncode is None for child in self.children):
                 raise RuntimeError("Previous pods have not been reaped")
             if self._readers or self._sessions:
                 raise RuntimeError("Previous router sessions are still closing")
@@ -306,17 +464,25 @@ class PodSupervisor:
             *command, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE, limit=_CONTROL_LIMIT + 1, env=env,
         ))
-        try:
-            child.process = await asyncio.shield(creation)
-        except asyncio.CancelledError:
-            # Recover a process created concurrently with startup cancellation.
-            child.process = await creation
+        child._creation_task = creation
+        self._creations.add(creation)
+
+        def created(task):
+            self._creations.discard(task)
+            if task.cancelled() or task.exception() is not None:
+                return
+            child.process = _PodProcess(task.result())
             child.pid = child.process.pid
-            raise
-        child.pid = child.process.pid
-        child._stdout_task = asyncio.create_task(self._read_stdout(child), name="latzero-pod-stdout-{}".format(child.index))
-        child._stderr_task = asyncio.create_task(self._read_stderr(child), name="latzero-pod-stderr-{}".format(child.index))
-        child._exit_task = asyncio.create_task(self._watch_child(child), name="latzero-pod-exit-{}".format(child.index))
+            child._stdout_task = asyncio.create_task(self._read_stdout(child), name="latzero-pod-stdout-{}".format(child.index))
+            child._stderr_task = asyncio.create_task(self._read_stderr(child), name="latzero-pod-stderr-{}".format(child.index))
+            child._exit_task = asyncio.create_task(self._watch_child(child), name="latzero-pod-exit-{}".format(child.index))
+            if self._stopping:
+                child.process.stdin.close()
+
+        creation.add_done_callback(created)
+        await asyncio.shield(creation)
+        if self._stopping:
+            return
         await self._send_control(child, {"config": config, "index": child.index, "pods": self.pods, "parent_pid": os.getpid()}, deadline)
 
     async def _send_control(self, child: PodChild, message: dict, deadline: Optional[float] = None) -> None:
@@ -335,21 +501,25 @@ class PodSupervisor:
             while True:
                 raw = await child.process.stdout.readline()
                 if not raw:
+                    child._stdout_eof = True
                     return
                 if len(raw) > _CONTROL_LIMIT or not raw.endswith(b"\n"):
                     raise ValueError("Invalid or oversized pod control output")
                 message = json.loads(raw)
                 if not isinstance(message, dict):
                     raise ValueError("Pod control output must be an object")
-                if message.get("ready") is True and not child._ready.done():
-                    if message.get("index") != child.index or type(message.get("index")) is not int or message.get("pid") != child.pid:
+                if message.get("ready") is True and child.port is None:
+                    if message.get("index") != child.index or type(message.get("index")) is not int:
                         raise ValueError("Pod readiness identity mismatch")
+                    child.process.attach_runtime(message.get("pid"))
+                    child.pid = message["pid"]
                     child.port = _port(message.get("port"), "port")
                     child.ws_port = _port(message.get("ws_port"), "ws_port", True)
                     if (child.ws_port is not None) != self.config.websocket_enabled:
                         raise ValueError("Pod WebSocket readiness mismatch")
                     child.status = "ready"
-                    child._ready.set_result(message)
+                    if not child._ready.done():
+                        child._ready.set_result(message)
                 elif message.get("configured") is True and child._ready.done() and not child._configured.done():
                     child._configured.set_result(message)
                 elif message.get("stopped") is True and not child._stopped.done():
@@ -357,6 +527,9 @@ class PodSupervisor:
                 elif isinstance(message.get("stats"), dict) and child._stats_pending:
                     child.stats = message["stats"]
                     child._stats_pending = False
+                    child._stats_requested = None
+                    if child.stats.get("health_error") or child.stats.get("persistence", {}).get("healthy") is False:
+                        self._child_failure(child, "Pod {} reported unhealthy state".format(child.index))
                 elif isinstance(message.get("error"), str):
                     raise RuntimeError(message["error"][:2048])
                 else:
@@ -365,12 +538,18 @@ class PodSupervisor:
             raise
         except Exception as exc:
             self._child_failure(child, "Pod {} control failed: {}".format(child.index, exc))
+            # Even a broken control producer must not block its own exit pipe.
+            with suppress(ConnectionError, OSError):
+                while await child.process.stdout.read(4096):
+                    pass
+                child._stdout_eof = True
 
     async def _read_stderr(self, child: PodChild) -> None:
         try:
             while True:
                 raw = await child.process.stderr.read(4096)
                 if not raw:
+                    child._stderr_eof = True
                     return
                 child.stderr_bytes += len(raw)
                 child.stderr_tail.append(raw.decode("utf-8", errors="replace"))
@@ -378,7 +557,7 @@ class PodSupervisor:
             return
 
     async def _watch_child(self, child: PodChild) -> int:
-        code = await child.process.wait()
+        code = await child.process.launcher.wait()
         if not self._stopping:
             self._child_failure(child, "Pod {} exited unexpectedly (code {})".format(child.index, code))
         elif child.status != "failed":
@@ -406,10 +585,15 @@ class PodSupervisor:
             async def request(child):
                 if not child._stats_pending and child.process.returncode is None:
                     child._stats_pending = True
+                    child._stats_requested = asyncio.get_running_loop().time()
                     try:
                         await self._send_control(child, {"operation": "stats"})
                     except (ConnectionError, OSError, asyncio.TimeoutError) as exc:
                         self._child_failure(child, "Pod {} health control failed: {}".format(child.index, exc))
+                elif child._stats_requested is not None and asyncio.get_running_loop().time() - child._stats_requested > self.config.write_timeout:
+                    self._child_failure(child, "Pod {} health reply deadline exceeded".format(child.index))
+                if child.process.runtime is not None and not child.process.runtime.alive():
+                    self._child_failure(child, "Pod {} runtime exited unexpectedly".format(child.index))
 
             await asyncio.gather(*(request(child) for child in self.children))
 
@@ -649,12 +833,17 @@ class PodSupervisor:
                 if not task.cancelled() and task.exception() is not None:
                     errors.append(str(task.exception()))
             self._health_task = None
-        reaped = all(child.process is None or child.process.returncode is not None for child in self.children)
+        reaped = not self._creations and all(child.process is None or child.process.returncode is not None
+                                           and child._stdout_eof and child._stderr_eof for child in self.children)
         if reaped and self._directory_lock is not None:
             self._directory_lock.release()
             self._directory_lock = None
         elif not reaped:
             errors.append("Unreaped pods retain the directory lease")
+        if reaped:
+            for child in self.children:
+                if child.process is not None:
+                    child.process.release_handle()
         self._started = False
         if self._closed is not None:
             self._closed.set()
@@ -704,6 +893,8 @@ class PodSupervisor:
             raise RuntimeError("Router shutdown failed: {}".format("; ".join(errors)))
 
     async def _stop_child(self, child: PodChild, grace: float) -> None:
+        if child._creation_task is not None and not child._creation_task.done():
+            await asyncio.wait_for(asyncio.shield(child._creation_task), self._remaining(grace))
         process = child.process
         if process is None:
             child.status = "stopped"
@@ -742,7 +933,7 @@ class PodSupervisor:
                 if not task.cancelled():
                     task.exception()
         stopped = child._stopped.result() if child._stopped.done() and not child._stopped.cancelled() else None
-        if escalated or process.returncode != 0 or not stopped or stopped.get("ok") is not True:
+        if escalated or process.returncode != 0 or not stopped or stopped.get("ok") is not True or not child._stdout_eof or not child._stderr_eof:
             child.status = "failed"
             error = "Pod {} did not stop cleanly (code {}, escalated {}, acknowledgement {})".format(
                 child.index, process.returncode, escalated, stopped,
@@ -771,6 +962,7 @@ class _ControlReader:
         self.loop = asyncio.get_running_loop()
         self.queue = asyncio.Queue(maxsize=1)
         self.closed = threading.Event()
+        self.eof = threading.Event()
         self.pending = None
         self.thread = threading.Thread(target=self._read, name="latzero-pod-stdin", daemon=True)
         self.thread.start()
@@ -779,6 +971,8 @@ class _ControlReader:
         while not self.closed.is_set():
             try:
                 raw = sys.stdin.buffer.readline(_CONTROL_LIMIT + 1)
+                if not raw:
+                    self.eof.set()
                 self.pending = asyncio.run_coroutine_threadsafe(self.queue.put(raw), self.loop)
                 self.pending.result()
                 if not raw or len(raw) > _CONTROL_LIMIT or not raw.endswith(b"\n"):
@@ -812,26 +1006,14 @@ class _ParentProcess:
         self.pid = pid
         self.handle = None
         if os.name == "nt":
-            import ctypes
-            from ctypes import wintypes
-
-            self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-            self.kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
-            self.kernel.OpenProcess.restype = wintypes.HANDLE
-            self.kernel.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
-            self.kernel.WaitForSingleObject.restype = wintypes.DWORD
-            self.kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
-            self.kernel.CloseHandle.restype = wintypes.BOOL
-            self.handle = self.kernel.OpenProcess(0x00100000, False, pid)
-            if not self.handle:
-                raise RuntimeError("Cannot observe parent process; refusing snapshot writes")
+            self.handle = _WindowsProcess(pid)
         if not self.alive():
             self.close()
             raise RuntimeError("Parent process is gone; refusing snapshot writes")
 
     def alive(self) -> bool:
         if os.name == "nt":
-            return self.kernel.WaitForSingleObject(self.handle, 0) == 258
+            return self.handle.alive()
         if os.getppid() != self.pid:
             return False
         try:
@@ -842,7 +1024,7 @@ class _ParentProcess:
 
     def close(self):
         if self.handle is not None:
-            self.kernel.CloseHandle(self.handle)
+            self.handle.close()
             self.handle = None
 
 
@@ -852,7 +1034,15 @@ def _child_output(message: dict) -> None:
 
 
 def _child_health(server: Any, routing: PoolRouting) -> dict:
+    pool_ids = []
+    size = 0
+    for pool_id in server._pools:
+        size += len(encode_message({"pool": pool_id}))
+        if size > _CONTROL_LIMIT // 2:
+            break
+        pool_ids.append(pool_id)
     return {"pod_index": routing.pod_index, "pid": os.getpid(), "pools": len(server._pools),
+            "pool_ids": pool_ids, "pool_ids_truncated": len(pool_ids) != len(server._pools),
             "connections": server._connection_count, "handshakes": len(server._pending_websockets),
             "health_error": server._health_error, "metrics": dict(server._metrics), "persistence": server._store.health}
 
@@ -883,7 +1073,7 @@ async def _child_run(resources: dict) -> int:
         # snapshot loader. A delayed orphan must never begin writing new state.
         from .server import LatZeroServer
 
-        if not parent.alive():
+        if not parent.alive() or reader.eof.is_set():
             raise RuntimeError("Parent process is gone; refusing snapshot writes")
         server = LatZeroServer(config, pool_routing=routing)
         await server.start()
@@ -943,7 +1133,8 @@ async def _child_run(resources: dict) -> int:
                 await server.stop()
             except Exception as exc:
                 error = error or "Shutdown failed: {}".format(exc)[:2048]
-        resources["io_stopped"] = server is None or not server._store.health["running"] and not server._store.health["in_flight"]
+        resources["io_stopped"] = server is None or (not server._store.health["running"]
+            and not server._store.health["in_flight"] and not server._store.health["dirty_pools"])
         if parent is not None:
             parent.close()
         if index is not None:
