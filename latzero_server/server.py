@@ -258,6 +258,8 @@ class LatZeroServer:
                         batch_window=self.config.persistence_batch_window, max_dirty_pools=self.config.max_pools)
                     self._load_snapshots()
                     self._initial_storage_loaded = True
+                elif self._store.health["running"] or self._store.health["in_flight"]:
+                    raise RuntimeError("Previous snapshot writer has not stopped; refusing unsafe restart")
             self._store.start()
             self._storage_started = True
             await self._worker_pool.start()
