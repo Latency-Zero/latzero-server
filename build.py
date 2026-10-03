@@ -127,6 +127,8 @@ def build(console: bool, onedir: bool, clean: bool) -> Path:
 
         hidden = [
             "latzero_server.tui",
+            "latzero_server.pods",
+            "latzero_server.directory_lock",
             "prompt_toolkit",
             "prompt_toolkit.application",
             "prompt_toolkit.layout",
